@@ -1,0 +1,379 @@
+surya: battery SOC from the power-on OCV and a coulomb counter
+
+Only when the locally built ADT has /surya-battery (capacity and the 25 C
+OCV-by-SOC column of the surya battery profile): start SOC from the QG's
+S7_PON_OCV through that table, then the battery current sampled every second
+is integrated; publish and log every 30 s; SMB5 termination sets 100%; a
+failed read keeps the last values instead of the 100% fallback. Without the
+node SweetBattery is unchanged for sweet.
+
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -3,6 +3,15 @@
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+  * See report.md for binary evidence, register provenance and integration.
++ *
++ * surya (Poco X3 NFC): the same PM6150 QG/SMB5 blocks, but its own battery.
++ * A locally built ADT node /surya-battery (scripts/adt-battery.py) carries the
++ * capacity and the 25 C column of the profile's pc-temp-v1-lut (OCV by SOC).
++ * With it, polling is on by default: the start SOC comes from the OCV the QG
++ * measures at power-on before any load (S7_PON_OCV, as qg_determine_pon_soc),
++ * then charge is counted from the battery current sampled every second.
++ * Runtime SOC in Linux comes from a closed user-space QG daemon; this is not it.
++ * Without the node the service behaves exactly as on sweet.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -12,9 +21,19 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++extern "C" {
++#include <pexpert/device_tree.h> /* SecureDT* have C linkage */
++}
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" uint64_t mach_absolute_time(void);
++extern "C" void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
++
++#define SURYA_OCV_MAX     128u
++#define SURYA_SAMPLE_MS   1000u
++#define SURYA_PUBLISH_N   30u   /* samples per publish: 30 s, as sweet */
++#define QG_V_RAW_TO_UV(r) ((unsigned)(((uint64_t)(r) * 194637u) / 1000u)) /* qg-defs.h */
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -28,14 +47,31 @@
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
++	unsigned fDesignMah;
++	/* surya: OCV table from the ADT and the coulomb counter. */
++	bool fSurya, fSuryaValid, fPublished;
++	const uint32_t *fOcvPct, *fOcvUv;
++	unsigned fOcvCount, fTick, fStartMv, fFailures;
++	uint8_t fSubtype;
++	const char *fStartSource;
++	int64_t fChargeNah, fCapNah;
++	uint64_t fLastAbs;
++	int fLastMa;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
++	bool suryaTable(void);
++	void suryaStart(void);
++	void suryaSample(void);
++	void suryaPoll(void);
++	unsigned suryaSoc100(unsigned uv) const;
++	bool suryaCurrent(int *ma) const;
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
++	static bool readWordHL(unsigned address, uint16_t *value);
+ 	static unsigned estimatePercent(unsigned mv);
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+@@ -72,6 +108,15 @@
+ 		}
+ 	}
+ 	fLastMode = -1;
++	fDesignMah = 5020;
++	fSurya = fSuryaValid = fPublished = false;
++	fOcvPct = fOcvUv = NULL;
++	fOcvCount = fTick = fStartMv = fFailures = 0;
++	fSubtype = 0;
++	fStartSource = "none";
++	fChargeNah = fCapNah = 0;
++	fLastAbs = 0;
++	fLastMa = 0;
+ 	return true;
+ }
+ 
+@@ -101,11 +146,11 @@
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (sweet DT nominal 5020, surya ADT). powerd: C*100/M. */
++	const unsigned capacity = (fDesignMah * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(fDesignMah);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,8 +164,8 @@
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", fDesignMah);
++	putNumber("DesignCapacity", fDesignMah);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+ 	putNumber("Temperature", 2500);
+@@ -137,7 +182,7 @@
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, fDesignMah, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -246,11 +291,211 @@
+ 	    charging, full, true, currentValid);
+ }
+ 
++/* High, low, high: a pair is consistent when both high bytes match. Unlike
++ * readWord this accepts a sample that changes every read (the current). */
++bool
++SweetBattery::readWordHL(unsigned address, uint16_t *value)
++{
++	for (unsigned attempt = 0; attempt < 4; ++attempt) {
++		uint8_t hi, lo, hi2;
++		if (sweet_spmi_read(0, address + 1, &hi) ||
++		    sweet_spmi_read(0, address, &lo) ||
++		    sweet_spmi_read(0, address + 1, &hi2)) {
++			return false;
++		}
++		if (hi == hi2) {
++			*value = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
++			return true;
++		}
++	}
++	return false;
++}
++
++/* /surya-battery from the locally built ADT: capacity and OCV(SOC) at 25 C. */
++bool
++SweetBattery::suryaTable(void)
++{
++	DTEntry node;
++	const uint32_t *cap = NULL;
++	unsigned capSize = 0, pctSize = 0, uvSize = 0;
++	if (SecureDTLookupEntry(NULL, "/surya-battery", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "capacity-mah", (void const **)&cap, &capSize) != kSuccess ||
++	    SecureDTGetProperty(node, "ocv-pct", (void const **)&fOcvPct, &pctSize) != kSuccess ||
++	    SecureDTGetProperty(node, "ocv-uv", (void const **)&fOcvUv, &uvSize) != kSuccess) {
++		return false;
++	}
++	fOcvCount = pctSize / 4u;
++	if (capSize != 4 || pctSize != uvSize || pctSize % 4u || fOcvCount < 2 ||
++	    fOcvCount > SURYA_OCV_MAX || *cap < 1000 || *cap > 10000) {
++		IOLog("SURYA BATTERY: malformed /surya-battery (cap %u, %u/%u bytes)\n",
++		    capSize == 4 ? *cap : 0, pctSize, uvSize);
++		return false;
++	}
++	for (unsigned i = 1; i < fOcvCount; ++i) {
++		if (fOcvPct[i] >= fOcvPct[i - 1] || fOcvUv[i] >= fOcvUv[i - 1]) {
++			IOLog("SURYA BATTERY: /surya-battery table not descending at %u\n", i);
++			return false;
++		}
++	}
++	fDesignMah = *cap;
++	fCapNah = (int64_t)fDesignMah * 1000000;
++	return true;
++}
++
++/* SOC x 100 for an open-circuit voltage: linear between table points. */
++unsigned
++SweetBattery::suryaSoc100(unsigned uv) const
++{
++	if (uv >= fOcvUv[0]) {
++		return fOcvPct[0];
++	}
++	for (unsigned i = 1; i < fOcvCount; ++i) {
++		if (uv >= fOcvUv[i]) {
++			return fOcvPct[i] + (unsigned)((uint64_t)(uv - fOcvUv[i]) *
++			       (fOcvPct[i - 1] - fOcvPct[i]) / (fOcvUv[i - 1] - fOcvUv[i]));
++		}
++	}
++	return fOcvPct[fOcvCount - 1];
++}
++
++/* LAST_ADC_I, the register sweet reads; positive = charging, as publish(). */
++bool
++SweetBattery::suryaCurrent(int *ma) const
++{
++	uint16_t raw;
++	if ((fSubtype != 3 && fSubtype != 4) || !readWordHL(0x48c2, &raw) || raw == 0x8000) {
++		return false;
++	}
++	int signedRaw = (raw & 0x8000u) ? (int)raw - 65536 : (int)raw;
++	*ma = (int)(-((int64_t)signedRaw * (fSubtype == 3 ? 152588 : 305176)) / 1000000);
++	return true;
++}
++
++/*
++ * Start SOC: the QG's power-on OCV (qg_determine_pon_soc's S7_PON_OCV), taken
++ * before the load. Every surya bring-up begins with a PMIC reset (keys to
++ * fastboot), so it is fresh. Fallback: the loaded voltage now, same table.
++ */
++void
++SweetBattery::suryaStart(void)
++{
++	uint16_t raw = 0;
++	unsigned uv = 0;
++	fStartSource = "S7_PON_OCV";
++	if (readWord(0x4870, &raw) && raw && raw != 0x8000) {
++		uv = QG_V_RAW_TO_UV(raw);
++	}
++	if (uv < 3000000u || uv > 4500000u) {
++		fStartSource = "LAST_ADC_V";
++		uv = 0;
++		if (readWordHL(0x48c0, &raw) && raw && raw != 0x8000) {
++			uv = QG_V_RAW_TO_UV(raw);
++		}
++	}
++	if (uv < 3000000u || uv > 4500000u) {
++		fStartSource = "none";
++		return;
++	}
++	fStartMv = uv / 1000u;
++	fChargeNah = fCapNah * suryaSoc100(uv) / 10000;
++	fLastAbs = mach_absolute_time();
++	fSuryaValid = true;
++	IOLog("SURYA BATTERY: start %s %umV -> %u.%02u%% of %umAh\n", fStartSource,
++	    fStartMv, (unsigned)(fChargeNah * 10000 / fCapNah) / 100u,
++	    (unsigned)(fChargeNah * 10000 / fCapNah) % 100u, fDesignMah);
++}
++
++/* Every second: integrate the battery current since the previous sample. */
++void
++SweetBattery::suryaSample(void)
++{
++	uint64_t now = mach_absolute_time(), ns = 0;
++	absolutetime_to_nanoseconds(now - fLastAbs, &ns);
++	fLastAbs = now;
++	int ma;
++	if (suryaCurrent(&ma)) {
++		fLastMa = ma;
++	}
++	if (!fSuryaValid) {
++		return;
++	}
++	if (ns > 60ull * 1000000000ull) {
++		IOLog("SURYA BATTERY: %llu ms without a sample; not counted\n", ns / 1000000ull);
++		return;
++	}
++	/* mA x ns -> nAh: 1 mAh = 3.6e12 mA*ns per 1e6 nAh. */
++	fChargeNah += (int64_t)fLastMa * (int64_t)ns / 3600000;
++	if (fChargeNah < 0) {
++		fChargeNah = 0;
++	} else if (fChargeNah > fCapNah) {
++		fChargeNah = fCapNah;
++	}
++}
++
++/* Every 30 s: charger state, publish, one log line. A failed read keeps the
++ * last published values instead of sweet's 100% fallback. */
++void
++SweetBattery::suryaPoll(void)
++{
++	if (!fSuryaValid) {
++		suryaStart();
++	}
++	uint8_t type, present, usb, path, charger, error, temperature;
++	uint16_t rawVoltage;
++	bool valid = fSuryaValid &&
++	    !sweet_spmi_read(0, 0x4804, &type) && type == 0x0d &&
++	    !sweet_spmi_read(0, 0x4808, &present) && (present & 1u) &&
++	    readWordHL(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
++	    !sweet_spmi_read(0, 0x1310, &usb) &&
++	    !sweet_spmi_read(0, 0x110b, &path) &&
++	    !sweet_spmi_read(0, 0x1006, &charger) &&
++	    !sweet_spmi_read(0, 0x1007, &error) &&
++	    !sweet_spmi_read(0, 0x100d, &temperature);
++	unsigned mv = valid ? QG_V_RAW_TO_UV(rawVoltage) / 1000u : 0;
++	valid = valid && mv >= 2800 && mv <= 4600;
++	if (!valid) {
++		if ((fFailures++ % 10u) == 0) {
++			IOLog("SURYA BATTERY: read failed (%u), start %s; keeping last values\n",
++			    fFailures, fStartSource);
++		}
++		if (!fPublished) {
++			publish(100, 4200, 0, true, true, false, true, false, false);
++		}
++		return;
++	}
++	fFailures = 0;
++	bool external = (usb & 0x10u) != 0;
++	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
++	unsigned state = charger & 7u;
++	bool charging = capable && state >= 1 && state <= 4 &&
++	    !(error & 2u) && !(temperature & 0x0cu);
++	bool full = external && state == 5 && !(error & 2u);
++	if (full) {
++		fChargeNah = fCapNah; /* SMB5 terminated the charge */
++	}
++	unsigned soc100 = (unsigned)(fChargeNah * 10000 / fCapNah);
++	unsigned percent = (soc100 + 50u) / 100u;
++	percent = percent < 1u ? 1u : (percent > 100u ? 100u : percent);
++	publish(percent, mv, fLastMa, external, capable, charging, full, true, true);
++	fPublished = true;
++	IOLog("SURYA BATTERY: soc=%u.%02u%% v=%umV i=%dmA ext=%d chg=%d state=%u full=%d start=%s %umV\n",
++	    soc100 / 100u, soc100 % 100u, mv, fLastMa, external, charging, state, full,
++	    fStartSource, fStartMv);
++}
++
+ void
+ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
++		if (self->fSurya) {
++			self->suryaSample();
++			if (++self->fTick % SURYA_PUBLISH_N == 0) {
++				self->suryaPoll();
++			}
++			sender->setTimeoutMS(SURYA_SAMPLE_MS);
++			return;
++		}
+ 		self->poll();
+ 		sender->setTimeoutMS(30000);
+ 	}
+@@ -262,20 +507,33 @@
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
++	/* surya: the ADT table turns real polling on unless sweetbattery=0. */
++	bool table = suryaTable();
++	int real = table ? 1 : 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
++	fSurya = table && fReal &&
++	    !sweet_spmi_read(0, 0x4805, &fSubtype) && (fSubtype == 3 || fSubtype == 4);
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+-	poll();
++	if (fSurya) {
++		suryaStart();
++		suryaPoll();
++	} else {
++		if (table) {
++			fDesignMah = 5020; /* sweet's static/estimated path, unchanged */
++		}
++		poll();
++	}
+ 	if (fReal) {
+ 		fLoop = IOWorkLoop::workLoop();
+ 		fTimer = IOTimerEventSource::timerEventSource(this, &SweetBattery::timerFired);
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(fSurya ? SURYA_SAMPLE_MS : 30000);
+ 		} else {
+ 			fReal = false;
++			fSurya = false;
+ 			poll();
+ 			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
+ 		}
