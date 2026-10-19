@@ -1,11 +1,22 @@
-surya: Novatek NT36672C over GENI SE0 SPI, milestone 1 (chip id)
+surya: Novatek NT36672C over GENI SE0 SPI, milestones 1-2
 
-sweettouch=2 selects it. Clocks, pins, SPI, bootloader reset and chip id
-read only; no firmware download and no touch reports yet.
+sweettouch=2 selects it. Milestone 1: clocks, pins, SPI, bootloader reset,
+chip id. Milestone 2: firmware download with the chip's hardware CRC, as
+Xiaomi's nvt_download_firmware_hw_crc. The firmware itself is Xiaomi's and is
+not in this tree: the locally built ADT carries it as /surya-touch "firmware".
+No touch reports yet.
 
---- a/bsd/dev/sweet_touch.c	2026-10-20 00:37:23.360869900 +0200
-+++ b/bsd/dev/sweet_touch.c	2026-10-20 00:37:23.421553500 +0200
-@@ -635,6 +635,394 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -14,6 +14,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -635,6 +636,710 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -19,8 +30,12 @@ read only; no firmware download and no touch reports yet.
 + *    is PM6150L GPIO 9, a different chip: gpio8 resets only the touch MCU.
 + *  - Power is shared with the panel (lab/ibb, L18A): nothing is voted here.
 + *    L11C, which the sweet driver votes, feeds the Wi-Fi RF on surya.
-+ * Milestone 1 only: clocks, pins, SPI, bootloader reset, chip id read.
-+ * No firmware download and no touch reports yet.
++ * Milestone 1: clocks, pins, SPI, bootloader reset, chip id read.
++ * Milestone 2: firmware download with the chip's hardware CRC
++ * (nvt_download_firmware_hw_crc, hw_crc = 2). The NT36672C keeps no firmware;
++ * Xiaomi's novatek_ts_huaxing_fw.bin is not redistributable, so it is not in
++ * this tree: a locally built ADT carries it as /surya-touch "firmware".
++ * No touch reports yet.
 + */
 +#define SURYA_SE_PA      0x00880000u
 +#define SURYA_WEST_PA    0x03500000u /* DT TLMM + WEST (0x100000) */
@@ -47,11 +62,38 @@ read only; no firmware download and no touch reports yet.
 +#define NVT_RD_FAST      0x3f310u /* novatek,spi-rd-fast-addr */
 +#define NVT_CHIP_ID      0x1f64eu
 +
++/* NT36675_memory_map, the map Xiaomi uses for id 0c xx xx 72 66 03. */
++#define NVT_EVENT_BUF    0x22d00u
++#define NVT_EV_HOST_CMD  0x50u
++#define NVT_EV_RESET     0x60u
++#define NVT_EV_FWINFO    0x78u
++#define NVT_EV_PID       0x9au
++#define NVT_BOOT_RDY     0x3f10du
++#define NVT_ILM_LENGTH   0x3f118u
++#define NVT_DLM_LENGTH   0x3f130u
++#define NVT_ILM_DES      0x3f128u
++#define NVT_DLM_DES      0x3f12cu
++#define NVT_G_ILM_CHK    0x3f100u
++#define NVT_G_DLM_CHK    0x3f104u
++#define NVT_R_ILM_CHK    0x3f120u
++#define NVT_R_DLM_CHK    0x3f124u
++#define NVT_BLD_CRC_EN   0x3f30eu
++#define NVT_BLD_CRC_FLAG 0x3f133u
++#define NVT_FW_CHUNK     4096u
++#define NVT_FW_PARTS     32u
++
 +static struct {
 +	vm_offset_t west;
 +	unsigned depth;
 +	uint8_t tx[SURYA_SPI_MAX], rx[SURYA_SPI_MAX];
++	uint8_t big[1 + NVT_FW_CHUNK];
 +} sy;
++
++/* nvt_ts_bin_map: where each firmware piece lies in the file and in SRAM. */
++static struct {
++	uint32_t bin, sram, size, crc;
++} nvt_parts[NVT_FW_PARTS];
++static unsigned nvt_nparts, nvt_fw_ver;
 +
 +/* Xiaomi trim_id_table, nt36xxx_mem_map.h: byte compared where mask is 1. */
 +static const struct {
@@ -213,7 +255,7 @@ read only; no firmware download and no touch reports yet.
 +surya_spi(unsigned op, const uint8_t *tx, uint8_t *rx, unsigned len)
 +{
 +	unsigned sent = 0, got = 0;
-+	if (st.dead || !len || len > SURYA_SPI_MAX || (op == SPI_OP_FULL && !rx)) {
++	if (st.dead || !len || len > sizeof(sy.big) || (op == SPI_OP_FULL && (!rx || len > SURYA_SPI_MAX))) {
 +		return EIO;
 +	}
 +	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
@@ -224,7 +266,7 @@ read only; no firmware download and no touch reports yet.
 +	touch_wr(st.se, SPI_TX_LEN, len);
 +	touch_wr(st.se, SPI_RX_LEN, op == SPI_OP_FULL ? len : 0u);
 +	touch_wr(st.se, SE_CMD, op << 27); /* no FRAGMENTATION: CS drops at the end */
-+	for (unsigned i = 0; i < 20000; ++i) {
++	for (unsigned i = 0; i < 20000u + 8u * len; ++i) {
 +		uint32_t irq = touch_irq();
 +		if (irq & SE_ERRORS) {
 +			printf("SURYA TOUCH: spi op=%u len=%u error irq=%#x\n", op, len, irq);
@@ -344,6 +386,286 @@ read only; no firmware download and no touch reports yet.
 +	return NULL;
 +}
 +
++static uint32_t
++nvt_le32(const uint8_t *p)
++{
++	return p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/* Read len-1 data bytes at addr into buf[1..] (page set first). */
++static int
++surya_nvt_read_at(uint32_t addr, uint8_t *buf, unsigned len)
++{
++	int err = surya_nvt_page(addr);
++	if (err) {
++		return err;
++	}
++	memset(buf, 0, len);
++	buf[0] = (uint8_t)(addr & 0x7fu);
++	return surya_nvt_read(buf, len);
++}
++
++/*
++ * update_firmware_request + nvt_bin_header_parser (hw_crc != 0: the CRCs come
++ * from the header). Checks every range against the file before any SPI write.
++ */
++static bool
++surya_fw_parse(const uint8_t *fw, unsigned size)
++{
++	unsigned need = 0;
++	for (unsigned i = size / 4096u; i > 0; --i) {
++		const uint8_t *flag = fw + i * 4096u - 3u;
++		if (!memcmp(flag, "NVT", 3) || !memcmp(flag, "MOD", 3)) {
++			need = i * 4096u;
++			break;
++		}
++	}
++	if (!need) {
++		printf("SURYA TOUCH: firmware has no NVT/MOD end flag\n");
++		return false;
++	}
++	nvt_fw_ver = fw[need - 4096u];
++	if (fw[need - 4096u] + fw[need - 4096u + 1u] != 0xff) {
++		printf("SURYA TOUCH: firmware version %#x + bar %#x != 0xff\n",
++		    fw[need - 4096u], fw[need - 4096u + 1u]);
++		return false;
++	}
++	uint32_t end = nvt_le32(fw);
++	unsigned info = 0;
++	for (uint32_t pos = 0x30u; pos < end; pos += 0x10u) {
++		++info;
++	}
++	unsigned ovly = (fw[0x28] & 0x10u) ? (fw[0x28] & 0x0fu) : 0u;
++	nvt_nparts = 2u + info + ovly;
++	if (nvt_nparts > NVT_FW_PARTS || 0x30u + 0x10u * info > size) {
++		printf("SURYA TOUCH: firmware header end=%#x info=%u ovly=%u is too large\n", end, info, ovly);
++		return false;
++	}
++	for (unsigned k = 0; k < nvt_nparts; ++k) {
++		const uint8_t *p;
++		if (k < 2u) {
++			p = fw + 12u * k;
++			nvt_parts[k].bin = nvt_le32(p);
++			nvt_parts[k].sram = nvt_le32(p + 4);
++			nvt_parts[k].size = nvt_le32(p + 8);
++			nvt_parts[k].crc = nvt_le32(fw + 0x18u + 4u * k);
++		} else {
++			uint32_t pos = k < 2u + info ? 0x30u + 0x10u * (k - 2u)
++			    : nvt_parts[1].bin + 0x10u * (k - 2u - info);
++			if (pos + 16u > size) {
++				printf("SURYA TOUCH: firmware header entry %u at %#x outside file\n", k, pos);
++				return false;
++			}
++			p = fw + pos;
++			nvt_parts[k].sram = nvt_le32(p);
++			nvt_parts[k].size = nvt_le32(p + 4);
++			nvt_parts[k].bin = nvt_le32(p + 8);
++			nvt_parts[k].crc = nvt_le32(p + 12);
++		}
++		/* nvt_write_firmware sends size + 1 bytes of a non-empty piece. */
++		if (nvt_parts[k].size &&
++		    ((uint64_t)nvt_parts[k].bin + nvt_parts[k].size + 1u > size)) {
++			printf("SURYA TOUCH: firmware piece %u bin=%#x size=%#x outside file\n",
++			    k, nvt_parts[k].bin, nvt_parts[k].size);
++			return false;
++		}
++	}
++	printf("SURYA TOUCH: firmware %u bytes, write size %#x, version %#x, %u pieces\n",
++	    size, need, fw[need - 4096u], nvt_nparts);
++	for (unsigned k = 0; k < nvt_nparts; ++k) {
++		if (nvt_parts[k].size) {
++			printf("SURYA TOUCH:   piece %u bin=%#x sram=%#x size=%#x crc=%#x\n", k,
++			    nvt_parts[k].bin, nvt_parts[k].sram, nvt_parts[k].size, nvt_parts[k].crc);
++		}
++	}
++	return true;
++}
++
++/* nvt_write_sram, in NVT_FW_CHUNK pieces: set page, then offset | 0x80 + data. */
++static int
++surya_nvt_sram(const uint8_t *data, uint32_t sram, uint32_t size)
++{
++	while (size) {
++		unsigned len = size < NVT_FW_CHUNK ? size : NVT_FW_CHUNK;
++		int err = surya_nvt_page(sram);
++		if (err) {
++			return err;
++		}
++		sy.big[0] = (uint8_t)((sram & 0x7fu) | 0x80u);
++		memcpy(sy.big + 1, data, len);
++		err = surya_spi(SPI_OP_TX, sy.big, NULL, len + 1u);
++		if (err) {
++			printf("SURYA TOUCH: sram write at %#x len %u failed %d\n", sram, len, err);
++			return err;
++		}
++		data += len;
++		sram += len;
++		size -= len;
++	}
++	return 0;
++}
++
++/* nvt_set_bld_crc_bank, hw_crc > 1: all three registers share one page. */
++static int
++surya_nvt_crc_bank(uint32_t des, uint32_t sram, uint32_t len_addr, uint32_t size,
++    uint32_t golden, uint32_t crc)
++{
++	int err = surya_nvt_page(des);
++	const uint8_t d[4] = {(uint8_t)(des & 0x7fu), (uint8_t)sram, (uint8_t)(sram >> 8), (uint8_t)(sram >> 16)};
++	const uint8_t l[4] = {(uint8_t)(len_addr & 0x7fu), (uint8_t)size, (uint8_t)(size >> 8),
++		                  (uint8_t)((size >> 16) & 1u)};
++	const uint8_t g[5] = {(uint8_t)(golden & 0x7fu), (uint8_t)crc, (uint8_t)(crc >> 8),
++		                  (uint8_t)(crc >> 16), (uint8_t)(crc >> 24)};
++	if (!err) {
++		err = surya_nvt_write(d, sizeof(d));
++	}
++	if (!err) {
++		err = surya_nvt_write(l, sizeof(l));
++	}
++	if (!err) {
++		err = surya_nvt_write(g, sizeof(g));
++	}
++	return err;
++}
++
++/* nvt_read_bld_hw_crc: CRC flags and golden/result sums after a failure. */
++static void
++surya_nvt_crc_dump(void)
++{
++	uint8_t b[8];
++	uint32_t gi = 0, ri = 0, gd = 0, rd = 0;
++	if (!surya_nvt_read_at(NVT_BLD_CRC_FLAG, b, 2)) {
++		printf("SURYA TOUCH: crc flag %#x (done=%u ilm_err=%u dlm_err=%u)\n",
++		    b[1], (b[1] >> 2) & 1u, b[1] & 1u, (b[1] >> 1) & 1u);
++	}
++	if (!surya_nvt_read_at(NVT_G_ILM_CHK, b, 5)) {
++		gi = nvt_le32(b + 1);
++	}
++	if (!surya_nvt_read_at(NVT_R_ILM_CHK, b, 5)) {
++		ri = nvt_le32(b + 1);
++	}
++	if (!surya_nvt_read_at(NVT_G_DLM_CHK, b, 5)) {
++		gd = nvt_le32(b + 1);
++	}
++	if (!surya_nvt_read_at(NVT_R_DLM_CHK, b, 5)) {
++		rd = nvt_le32(b + 1);
++	}
++	printf("SURYA TOUCH: ilm bin=%#x golden=%#x result=%#x; dlm bin=%#x golden=%#x result=%#x\n",
++	    nvt_parts[0].crc, gi, ri, nvt_parts[1].crc, gd, rd);
++}
++
++/* One pass of nvt_download_firmware_hw_crc; returns the reset state read last. */
++static int
++surya_nvt_download(const uint8_t *fw, uint8_t *state)
++{
++	uint8_t b[8];
++	*state = 0;
++	/* nvt_bootloader_reset */
++	int err = surya_nvt_write_addr(NVT_SWRST_N8, 0x69);
++	if (err) {
++		return err;
++	}
++	touch_wait(5);
++	if ((err = surya_nvt_write_addr(NVT_RD_FAST, 0x00))) {
++		return err;
++	}
++	/* nvt_write_firmware: every non-empty piece, size + 1 bytes. */
++	for (unsigned k = 0; k < nvt_nparts; ++k) {
++		if (nvt_parts[k].size &&
++		    (err = surya_nvt_sram(fw + nvt_parts[k].bin, nvt_parts[k].sram, nvt_parts[k].size + 1u))) {
++			return err;
++		}
++	}
++	/* nvt_set_bld_hw_crc: ILM and DLM destination, length, golden CRC. */
++	if ((err = surya_nvt_crc_bank(NVT_ILM_DES, nvt_parts[0].sram, NVT_ILM_LENGTH,
++	    nvt_parts[0].size, NVT_G_ILM_CHK, nvt_parts[0].crc)) ||
++	    (err = surya_nvt_crc_bank(NVT_DLM_DES, nvt_parts[1].sram, NVT_DLM_LENGTH,
++	    nvt_parts[1].size, NVT_G_DLM_CHK, nvt_parts[1].crc))) {
++		return err;
++	}
++	/* nvt_bld_crc_enable: set bit 7 of BLD_CRC_EN. */
++	if ((err = surya_nvt_read_at(NVT_BLD_CRC_EN, b, 2))) {
++		return err;
++	}
++	const uint8_t en[2] = {(uint8_t)(NVT_BLD_CRC_EN & 0x7fu), (uint8_t)(b[1] | 0x80u)};
++	if ((err = surya_nvt_write(en, sizeof(en)))) {
++		return err;
++	}
++	/* nvt_fw_crc_enable: clear reset status, host command 0xAE. */
++	const uint8_t clr[2] = {NVT_EV_RESET, 0x00};
++	const uint8_t cmd[2] = {NVT_EV_HOST_CMD, 0xae};
++	if ((err = surya_nvt_page(NVT_EVENT_BUF)) || (err = surya_nvt_write(clr, sizeof(clr))) ||
++	    (err = surya_nvt_write(cmd, sizeof(cmd)))) {
++		return err;
++	}
++	/* nvt_boot_ready */
++	if ((err = surya_nvt_write_addr(NVT_BOOT_RDY, 1))) {
++		return err;
++	}
++	touch_wait(5);
++	/* nvt_check_fw_reset_state(RESET_STATE_INIT): 0xA0..0xAF within ~100 ms. */
++	for (unsigned retry = 0; retry <= 10; ++retry) {
++		if ((err = surya_nvt_read_at(NVT_EVENT_BUF | NVT_EV_RESET, b, 6))) {
++			return err;
++		}
++		*state = b[1];
++		if (b[1] >= 0xa0u && b[1] <= 0xafu) {
++			return 0;
++		}
++		touch_wait(10);
++	}
++	return ETIMEDOUT;
++}
++
++/* Milestone 2: load, check, download; then nvt_get_fw_info + nvt_read_pid. */
++static bool
++surya_fw_load(void)
++{
++	DTEntry node;
++	const uint8_t *fw = NULL;
++	unsigned size = 0;
++	if (SecureDTLookupEntry(NULL, "/surya-touch", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "firmware", (void const **)&fw, &size) != kSuccess ||
++	    size < 4096u) {
++		printf("SURYA TOUCH: no /surya-touch firmware in the device tree\n");
++		return false;
++	}
++	if (!surya_fw_parse(fw, size)) {
++		return false;
++	}
++	int err = EIO;
++	uint8_t state = 0;
++	uint64_t t0 = mach_absolute_time(), ns = 0;
++	for (unsigned attempt = 0; attempt < 3 && !st.dead; ++attempt) {
++		err = surya_nvt_download(fw, &state);
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		printf("SURYA TOUCH: download attempt %u err=%d reset state=%#x after %llu ms\n",
++		    attempt, err, state, ns / 1000000ull);
++		if (!err) {
++			break;
++		}
++	}
++	if (err) {
++		if (!st.dead) {
++			surya_nvt_crc_dump();
++		}
++		return false;
++	}
++	uint8_t b[20];
++	if (surya_nvt_read_at(NVT_EVENT_BUF | NVT_EV_FWINFO, b, 17)) {
++		return false;
++	}
++	unsigned ver = b[1], bar = b[2], x = b[3], y = b[4];
++	unsigned w = ((unsigned)b[5] << 8) | b[6], h = ((unsigned)b[7] << 8) | b[8];
++	printf("SURYA TOUCH: fw info ver=%#x ~ver=%#x grid=%ux%u max=%ux%u buttons=%u type=%#x\n",
++	    ver, bar, x, y, w, h, b[11], b[14]);
++	if (!surya_nvt_read_at(NVT_EVENT_BUF | NVT_EV_PID, b, 3)) {
++		printf("SURYA TOUCH: pid=%04x\n", ((unsigned)b[2] << 8) | b[1]);
++	}
++	/* Milestone 2 check: running firmware is the file's, with surya's 16x36 grid. */
++	return ver + bar == 0xffu && ver == nvt_fw_ver && x == 16u && y == 36u;
++}
++
 +static void
 +surya_touch_thread(void *arg, wait_result_t result)
 +{
@@ -351,7 +673,7 @@ read only; no firmware download and no touch reports yet.
 +	(void)arg;
 +	(void)result;
 +	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
-+	printf("SURYA TOUCH: Novatek SPI milestone 1 (chip id) in %u s\n", delay_s);
++	printf("SURYA TOUCH: Novatek SPI milestones 1-2 (chip id, firmware) in %u s\n", delay_s);
 +	touch_wait(delay_s * 1000u);
 +	printf("SURYA TOUCH: mapping GCC/TLMM/SE0\n");
 +	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
@@ -392,6 +714,11 @@ read only; no firmware download and no touch reports yet.
 +	const char *name = err ? NULL : surya_chip_name(id);
 +	printf("SURYA TOUCH: milestone 1 %s: %s\n", name ? "PASSED" : "FAILED",
 +	    name ? name : "no Novatek id");
++	/* Only the 0c xx xx 72 66 03 chip uses the NT36675 map hard-coded above. */
++	if (!name || id[0] != 0x0cu || id[3] != 0x72u || id[4] != 0x66u || id[5] != 0x03u) {
++		goto out;
++	}
++	printf("SURYA TOUCH: milestone 2 %s\n", surya_fw_load() ? "PASSED" : "FAILED");
 +out:
 +	(void)thread_terminate(current_thread());
 +	thread_block(THREAD_CONTINUE_NULL);
@@ -400,7 +727,7 @@ read only; no firmware download and no touch reports yet.
  void
  sweet_touch_init(void)
  {
-@@ -650,7 +1038,9 @@
+@@ -650,7 +1355,9 @@
  		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
  		return;
  	}
