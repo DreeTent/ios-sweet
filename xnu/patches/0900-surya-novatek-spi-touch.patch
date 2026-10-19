@@ -1,10 +1,12 @@
-surya: Novatek NT36672C over GENI SE0 SPI, milestones 1-2
+surya: Novatek NT36672C over GENI SE0 SPI, milestones 1-3
 
 sweettouch=2 selects it. Milestone 1: clocks, pins, SPI, bootloader reset,
 chip id. Milestone 2: firmware download with the chip's hardware CRC, as
 Xiaomi's nvt_download_firmware_hw_crc. The firmware itself is Xiaomi's and is
 not in this tree: the locally built ADT carries it as /surya-touch "firmware".
-No touch reports yet.
+Milestone 3: finger points from the event buffer, logged only; reads are
+paced by gpio9's edge latched in TLMM (no CPU interrupt), with polling as
+fallback.
 
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
@@ -16,7 +18,7 @@ No touch reports yet.
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  /* Mach MIG declaration is not included by BSD's exported thread.h. */
-@@ -635,6 +636,717 @@
+@@ -635,6 +636,866 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -35,7 +37,8 @@ No touch reports yet.
 + * (nvt_download_firmware_hw_crc, hw_crc = 2). The NT36672C keeps no firmware;
 + * Xiaomi's novatek_ts_huaxing_fw.bin is not redistributable, so it is not in
 + * this tree: a locally built ADT carries it as /surya-touch "firmware".
-+ * No touch reports yet.
++ * Milestone 3: finger points read from the event buffer and logged; not yet
++ * passed to iOS.
 + */
 +#define SURYA_SE_PA      0x00880000u
 +#define SURYA_WEST_PA    0x03500000u /* DT TLMM + WEST (0x100000) */
@@ -43,7 +46,7 @@ No touch reports yet.
 +#define SURYA_VOTE_MASK  (0x1fu << 6) /* wrap0 m_ahb, s_ahb, core, core_2x, S0 */
 +#define SURYA_RST_GPIO   8u
 +#define SURYA_IRQ_GPIO   9u
-+#define SURYA_SPI_MAX    64u
++#define SURYA_SPI_MAX    128u
 +
 +#define SPI_CPHA_REG     0x224u
 +#define SPI_LOOPBACK_REG 0x22cu
@@ -81,6 +84,11 @@ No touch reports yet.
 +#define NVT_BLD_CRC_FLAG 0x3f133u
 +#define NVT_FW_CHUNK     4096u
 +#define NVT_FW_PARTS     32u
++#define NVT_POINT_LEN    65u  /* nt36xxx.c POINT_DATA_LEN: 10 fingers x 6 + extras */
++
++/* pinctrl-sdmmagpie.c: per-GPIO interrupt config and latched status. */
++#define TLMM_INTR_CFG(n)    (TOUCH_GPIO_CFG(n) + 8u)
++#define TLMM_INTR_STATUS(n) (TOUCH_GPIO_CFG(n) + 0xcu)
 +
 +static struct {
 +	vm_offset_t west;
@@ -94,6 +102,7 @@ No touch reports yet.
 +	uint32_t bin, sram, size, crc;
 +} nvt_parts[NVT_FW_PARTS];
 +static unsigned nvt_nparts, nvt_fw_ver;
++static unsigned nvt_max_x = 1080u, nvt_max_y = 2400u;
 +
 +/* Xiaomi trim_id_table, nt36xxx_mem_map.h: byte compared where mask is 1. */
 +static const struct {
@@ -659,6 +668,10 @@ No touch reports yet.
 +	unsigned w = ((unsigned)b[5] << 8) | b[6], h = ((unsigned)b[7] << 8) | b[8];
 +	printf("SURYA TOUCH: fw info ver=%#x ~ver=%#x grid=%ux%u max=%ux%u buttons=%u type=%#x\n",
 +	    ver, bar, x, y, w, h, b[11], b[14]);
++	if (ver + bar == 0xffu && w && h) {
++		nvt_max_x = w;
++		nvt_max_y = h;
++	}
 +	unsigned pid = 0;
 +	if (!surya_nvt_read_at(NVT_EVENT_BUF | NVT_EV_PID, b, 3)) {
 +		pid = ((unsigned)b[2] << 8) | b[1];
@@ -673,6 +686,139 @@ No touch reports yet.
 +	return ver + bar == 0xffu && ver == nvt_fw_ver && x == want_x && y == 36u;
 +}
 +
++/* Milestone 3 state: fingers down after the last frame, as in nvt_ts_work_func. */
++static struct {
++	uint32_t down;
++	int x[TOUCH_MAX], y[TOUCH_MAX];
++	unsigned wdt, quiet, edges, reads, errors;
++} sf;
++
++static void
++surya_touch_release_all(void)
++{
++	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++		if (sf.down & (1u << i)) {
++			printf("SURYA TOUCH: finger %u up x=%d y=%d\n", i + 1u, sf.x[i], sf.y[i]);
++		}
++	}
++	sf.down = 0;
++}
++
++/* One event-buffer read: nvt_ts_work_func parsing; logs instead of input reports. */
++static void
++surya_touch_frame(void)
++{
++	uint8_t b[NVT_POINT_LEN + 1u];
++	int err = surya_nvt_read_at(NVT_EVENT_BUF, b, sizeof(b));
++	++sf.reads;
++	if (err) {
++		if ((sf.errors++ % 100u) == 0) {
++			printf("SURYA TOUCH: event read err=%d\n", err);
++		}
++		if (sf.errors == 10) {
++			surya_touch_release_all();
++		}
++		return;
++	}
++	sf.errors = 0;
++	/* nvt_wdt_fw_recovery: firmware reset leaves 0xFD/0xFE in bytes 1..6. */
++	bool wdt = true;
++	for (unsigned i = 1; i < 7; ++i) {
++		if (b[i] != 0xfdu && b[i] != 0xfeu) {
++			wdt = false;
++		}
++	}
++	if (wdt) {
++		if (++sf.wdt > 10u) {
++			printf("SURYA TOUCH: firmware watchdog pattern %02x; reloading firmware\n", b[1]);
++			sf.wdt = 0;
++			surya_touch_release_all();
++			printf("SURYA TOUCH: reload %s\n", surya_fw_load() ? "ok" : "FAILED");
++		}
++		return;
++	}
++	sf.wdt = 0;
++	uint32_t now = 0;
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0}, w[TOUCH_MAX] = {0};
++	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++		const uint8_t *p = b + 1u + 6u * i;
++		unsigned id = p[0] >> 3, state = p[0] & 7u;
++		/* 1: finger enters, 2: finger moves; other ids are gesture/palm packets. */
++		if (!id || id > TOUCH_MAX || (state != 1u && state != 2u)) {
++			continue;
++		}
++		unsigned px = ((unsigned)p[1] << 4) | (p[3] >> 4u);
++		unsigned py = ((unsigned)p[2] << 4) | (p[3] & 0x0fu);
++		if (px > nvt_max_x || py > nvt_max_y) {
++			continue;
++		}
++		now |= 1u << (id - 1u);
++		x[id - 1u] = (int)px;
++		y[id - 1u] = (int)py;
++		w[id - 1u] = p[4] ? p[4] : 1;
++	}
++	bool moved = false;
++	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++		uint32_t bit = 1u << i;
++		if ((now & bit) && !(sf.down & bit)) {
++			printf("SURYA TOUCH: finger %u down x=%d y=%d w=%d\n", i + 1u, x[i], y[i], w[i]);
++		} else if (!(now & bit) && (sf.down & bit)) {
++			printf("SURYA TOUCH: finger %u up x=%d y=%d\n", i + 1u, sf.x[i], sf.y[i]);
++		} else if ((now & bit) && (x[i] != sf.x[i] || y[i] != sf.y[i])) {
++			moved = true;
++		}
++		if (now & bit) {
++			sf.x[i] = x[i];
++			sf.y[i] = y[i];
++		}
++	}
++	/* Moves: at most one line per ~100 ms, all fingers down. */
++	if (moved && ++sf.quiet >= 10u) {
++		sf.quiet = 0;
++		for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++			if (now & (1u << i)) {
++				printf("SURYA TOUCH: finger %u move x=%d y=%d w=%d\n", i + 1u, x[i], y[i], w[i]);
++			}
++		}
++	}
++	sf.down = now;
++}
++
++/*
++ * Poll every 10 ms like the sweet driver, but read on fresh frames: TLMM
++ * latches gpio9's rising edge (RAW_STATUS_EN, DETECT=1, POLARITY=1) with
++ * INTR_ENABLE left 0, so no CPU interrupt is raised. Fallback reads every
++ * 100 ms, and every tick while a finger is down.
++ */
++static void
++surya_touch_loop(void)
++{
++	surya_pin(st.gpio, SURYA_IRQ_GPIO, 0, 0, 0, false, false); /* input, no pull */
++	uint32_t ic = touch_rd(st.gpio, TLMM_INTR_CFG(SURYA_IRQ_GPIO));
++	touch_wr(st.gpio, TLMM_INTR_CFG(SURYA_IRQ_GPIO),
++	    (ic & ~0x1fu) | (1u << 4) | (1u << 2) | (1u << 1));
++	touch_wr(st.gpio, TLMM_INTR_STATUS(SURYA_IRQ_GPIO), 0);
++	printf("SURYA TOUCH: milestone 3 polling, intr_cfg %#x -> %#x\n",
++	    ic, touch_rd(st.gpio, TLMM_INTR_CFG(SURYA_IRQ_GPIO)));
++	unsigned ticks = 0;
++	while (!st.dead) {
++		bool edge = touch_rd(st.gpio, TLMM_INTR_STATUS(SURYA_IRQ_GPIO)) & 1u;
++		if (edge) {
++			touch_wr(st.gpio, TLMM_INTR_STATUS(SURYA_IRQ_GPIO), 0);
++			++sf.edges;
++		}
++		if (edge || sf.down || (ticks % 10u) == 0) {
++			surya_touch_frame();
++		}
++		if (++ticks % 3000u == 0) {
++			printf("SURYA TOUCH: stats edges=%u reads=%u\n", sf.edges, sf.reads);
++		}
++		touch_wait(10);
++	}
++	printf("SURYA TOUCH: SE0 dead; touch loop stopped\n");
++	surya_touch_release_all();
++}
++
 +static void
 +surya_touch_thread(void *arg, wait_result_t result)
 +{
@@ -680,7 +826,7 @@ No touch reports yet.
 +	(void)arg;
 +	(void)result;
 +	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
-+	printf("SURYA TOUCH: Novatek SPI milestones 1-2 (chip id, firmware) in %u s\n", delay_s);
++	printf("SURYA TOUCH: Novatek SPI milestones 1-3 (chip id, firmware, points) in %u s\n", delay_s);
 +	touch_wait(delay_s * 1000u);
 +	printf("SURYA TOUCH: mapping GCC/TLMM/SE0\n");
 +	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
@@ -725,7 +871,12 @@ No touch reports yet.
 +	if (!name || id[0] != 0x0cu || id[3] != 0x72u || id[4] != 0x66u || id[5] != 0x03u) {
 +		goto out;
 +	}
-+	printf("SURYA TOUCH: milestone 2 %s\n", surya_fw_load() ? "PASSED" : "FAILED");
++	if (!surya_fw_load()) {
++		printf("SURYA TOUCH: milestone 2 FAILED\n");
++		goto out;
++	}
++	printf("SURYA TOUCH: milestone 2 PASSED\n");
++	surya_touch_loop();
 +out:
 +	(void)thread_terminate(current_thread());
 +	thread_block(THREAD_CONTINUE_NULL);
@@ -734,7 +885,7 @@ No touch reports yet.
  void
  sweet_touch_init(void)
  {
-@@ -650,7 +1362,9 @@
+@@ -650,7 +1511,9 @@
  		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
  		return;
  	}
