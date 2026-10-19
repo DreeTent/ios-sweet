@@ -16,7 +16,7 @@ No touch reports yet.
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  /* Mach MIG declaration is not included by BSD's exported thread.h. */
-@@ -635,6 +636,710 @@
+@@ -635,6 +636,717 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -659,11 +659,18 @@ No touch reports yet.
 +	unsigned w = ((unsigned)b[5] << 8) | b[6], h = ((unsigned)b[7] << 8) | b[8];
 +	printf("SURYA TOUCH: fw info ver=%#x ~ver=%#x grid=%ux%u max=%ux%u buttons=%u type=%#x\n",
 +	    ver, bar, x, y, w, h, b[11], b[14]);
++	unsigned pid = 0;
 +	if (!surya_nvt_read_at(NVT_EVENT_BUF | NVT_EV_PID, b, 3)) {
-+		printf("SURYA TOUCH: pid=%04x\n", ((unsigned)b[2] << 8) | b[1]);
++		pid = ((unsigned)b[2] << 8) | b[1];
++		printf("SURYA TOUCH: pid=%04x\n", pid);
 +	}
-+	/* Milestone 2 check: running firmware is the file's, with surya's 16x36 grid. */
-+	return ver + bar == 0xffu && ver == nvt_fw_ver && x == 16u && y == 36u;
++	/*
++	 * Milestone 2 check: the running firmware is the file's, and its grid is
++	 * the one surya's DT gives for this PID (novatek-mp-criteria-5936: 18x36,
++	 * -5938: 16x36).
++	 */
++	unsigned want_x = pid == 0x5936u ? 18u : pid == 0x5938u ? 16u : 0u;
++	return ver + bar == 0xffu && ver == nvt_fw_ver && x == want_x && y == 36u;
 +}
 +
 +static void
@@ -727,7 +734,7 @@ No touch reports yet.
  void
  sweet_touch_init(void)
  {
-@@ -650,7 +1355,9 @@
+@@ -650,7 +1362,9 @@
  		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
  		return;
  	}
