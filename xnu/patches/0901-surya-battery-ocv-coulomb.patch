@@ -14,9 +14,9 @@ Backlight: an AppleARMBacklight service (backlight-control = true), started
 from SweetBattery when the local ADT has /backlight. iOS's "brightness"
 (0..1024) drives the PM6150L WLED5 through sweet_spmi_write (0902): 0 turns
 the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
-Time: the PM6150 RTC behind SweetPlatformExpert's clock hooks (0903): read
-RTC_READ 0x6048, write as qpnp_rtc_set_time, start it if stopped, publish
-IORTC when APPS owns the RTC write channel.
+Time: SweetPlatformExpert's clock hooks (0903) go to surya_time_* in
+sweet_touch.c (0900) and IORTC is published; the 1 s timer calls
+surya_time_tick until the saved time is applied.
 
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
@@ -36,7 +36,7 @@ IORTC when APPS owns the RTC write channel.
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
-@@ -11,10 +20,33 @@
+@@ -11,10 +20,37 @@
  #include <IOKit/IOTimerEventSource.h>
  #include <IOKit/pwr_mgt/IOPMPowerSource.h>
  #include <libkern/c++/OSCollectionIterator.h>
@@ -53,6 +53,10 @@ IORTC when APPS owns the RTC write channel.
 +/* iokit/Kernel/arm/SweetPlatformExpert.cpp */
 +extern "C" long (*sweet_rtc_get_hook)(void);
 +extern "C" void (*sweet_rtc_set_hook)(long secs);
++/* bsd/dev/sweet_touch.c */
++extern "C" long surya_time_get(void);
++extern "C" void surya_time_set(long secs);
++extern "C" int surya_time_tick(void);
 +static uint32_t surya_rtc_read(void);
 +static int surya_rtc_attach(void);
 +extern "C" uint64_t mach_absolute_time(void);
@@ -70,7 +74,7 @@ IORTC when APPS owns the RTC write channel.
  
  class SweetBattery : public IOPMPowerSource {
  	OSDeclareDefaultStructors(SweetBattery);
-@@ -28,14 +60,37 @@
+@@ -28,14 +64,38 @@
  	IOTimerEventSource *fTimer;
  	bool fTimerAdded, fRunning, fReal;
  	int fLastMode;
@@ -87,7 +91,8 @@ IORTC when APPS owns the RTC write channel.
 +	uint8_t fChgLast[11];
 +	bool fChgLogged;
 +	uint32_t fRtcSec;
-+	int fRtcCtrl;  /* RTC control byte at attach, -1 untouched */
++	int fRtcCtrl;  /* 0 once the clock hooks are attached, -1 before */
++	bool fTimeDone;
 +	void suryaChargerLog(void);
  	void putNumber(const char *key, UInt32 value);
  	void putBool(const char *key, bool value);
@@ -108,7 +113,7 @@ IORTC when APPS owns the RTC write channel.
  	static unsigned estimatePercent(unsigned mv);
  };
  OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
-@@ -72,6 +127,19 @@
+@@ -72,6 +132,20 @@
  		}
  	}
  	fLastMode = -1;
@@ -125,10 +130,11 @@ IORTC when APPS owns the RTC write channel.
 +	fChgLogged = false;
 +	fRtcSec = 0;
 +	fRtcCtrl = -1;
++	fTimeDone = false;
  	return true;
  }
  
-@@ -101,11 +169,11 @@
+@@ -101,11 +175,11 @@
  SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
      bool capable, bool charging, bool full, bool measured, bool currentValid)
  {
@@ -143,7 +149,7 @@ IORTC when APPS owns the RTC write channel.
  	setExternalConnected(external);
  	setExternalChargeCapable(capable);
  	setIsCharging(charging);
-@@ -119,8 +187,8 @@
+@@ -119,8 +193,8 @@
  	putBool("FullyCharged", full);
  	putBool("AppleRawExternalConnected", external);
  	putNumber("AppleRawCurrentCapacity", capacity);
@@ -154,7 +160,7 @@ IORTC when APPS owns the RTC write channel.
  	putNumber("InstantAmperage", (UInt32)ma);
  	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
  	putNumber("Temperature", 2500);
-@@ -137,7 +205,7 @@
+@@ -137,7 +211,7 @@
  		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
  		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
  		    kIOBatteryFlagsKey};
@@ -163,7 +169,7 @@ IORTC when APPS owns the RTC write channel.
  		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
  		    (charging ? kIOBatteryCharge : 0))};
  		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
-@@ -246,41 +314,616 @@
+@@ -246,41 +320,567 @@
  	    charging, full, true, currentValid);
  }
  
@@ -329,14 +335,10 @@ IORTC when APPS owns the RTC write channel.
 +}
 +
 +/*
-+ * PM6150 RTC (qpnp-rtc.c, RTC_RW at 0x6000 on SID 0). Seconds are read from
-+ * RTC_READ 0x6048..0x604b: read the four bytes, re-read byte 0 and retry if
-+ * it rolled over. 0x6040..0x6043 are the write data, not the count (reading
-+ * them gave the bogus rtc0=0 of 20.10). Surya's DT keeps Linux from writing
-+ * the RTC (qpnp-rtc-write = 0); that is a policy, and iOS here owns the time.
++ * PM6150 RTC seconds for the battery log (RTC_READ 0x6048..0x604b; 0x6040 is
++ * the write data, which gave the bogus rtc0=0 of 20.10). The wall clock built
++ * on this RTC lives in bsd/dev/sweet_touch.c (surya_time_*).
 + */
-+static IOLock *gSuryaRtcLock;
-+
 +static uint32_t
 +surya_rtc_read(void)
 +{
@@ -357,67 +359,19 @@ IORTC when APPS owns the RTC write channel.
 +	return 0xffffffffu;
 +}
 +
-+/* SweetPlatformExpert::getGMTTimeOfDay -> here: the RTC seconds, 0 on failure. */
-+static long
-+surya_rtc_get(void)
-+{
-+	uint32_t secs = surya_rtc_read();
-+	return secs == 0xffffffffu ? 0 : (long)secs;
-+}
-+
 +/*
-+ * SweetPlatformExpert::setGMTTimeOfDay -> here, when iOS sets the time
-+ * (settimeofday -> clock_set_calendar_microtime -> PESetUTCTimeOfDay).
-+ * qpnp_rtc_set_time's order: RTC off, WDATA0 = 0, WDATA1..3, WDATA0, RTC on.
-+ */
-+static void
-+surya_rtc_set(long secs)
-+{
-+	if (secs < 0 || secs > 0xffffffffL || !gSuryaRtcLock) {
-+		return;
-+	}
-+	uint32_t v = (uint32_t)secs;
-+	uint8_t ctrl = 0;
-+	IOLockLock(gSuryaRtcLock);
-+	int err = sweet_spmi_read(0, 0x6046, &ctrl);
-+	if (!err) {
-+		err |= sweet_spmi_write(0, 0x6046, (uint8_t)(ctrl & ~0x80u));
-+		err |= sweet_spmi_write(0, 0x6040, 0);
-+		err |= sweet_spmi_write(0, 0x6041, (uint8_t)(v >> 8));
-+		err |= sweet_spmi_write(0, 0x6042, (uint8_t)(v >> 16));
-+		err |= sweet_spmi_write(0, 0x6043, (uint8_t)(v >> 24));
-+		err |= sweet_spmi_write(0, 0x6040, (uint8_t)v);
-+		err |= sweet_spmi_write(0, 0x6046, (uint8_t)(ctrl | 0x80u));
-+	}
-+	IOLockUnlock(gSuryaRtcLock);
-+	IOLog("SURYA RTC: set %u%s\n", v, err ? " FAILED" : "");
-+}
-+
-+/*
-+ * At SweetBattery start on surya: if APPS owns the RTC write channel, make
-+ * sure the RTC counts, route the platform clock to it and publish IORTC, which
-+ * IOKitInitializeTime waits up to 30 s for before clock_initialize_calendar.
-+ * Returns the RTC control byte, or -1 when the RTC is left alone.
++ * Route SweetPlatformExpert's clock to surya_time_* and publish IORTC, which
++ * IOKitInitializeTime waits up to 30 s for. This runs during IOKit matching,
++ * before the root is mounted; the saved offset is applied later from the
++ * 1 s timer (surya_time_tick).
 + */
 +static int
 +surya_rtc_attach(void)
 +{
-+	unsigned apid = 0;
-+	uint8_t ctrl = 0;
-+	if (sweet_spmi_owner(0, 0x60, &apid) != 0 || sweet_spmi_read(0, 0x6046, &ctrl)) {
-+		return -1;
-+	}
-+	gSuryaRtcLock = IOLockAlloc();
-+	if (!gSuryaRtcLock) {
-+		return -1;
-+	}
-+	if (!(ctrl & 0x80u)) {
-+		(void)sweet_spmi_write(0, 0x6046, (uint8_t)(ctrl | 0x80u)); /* start counting */
-+	}
-+	sweet_rtc_get_hook = surya_rtc_get;
-+	sweet_rtc_set_hook = surya_rtc_set;
++	sweet_rtc_get_hook = surya_time_get;
++	sweet_rtc_set_hook = surya_time_set;
 +	IOService::publishResource("IORTC");
-+	return ctrl;
++	return 0;
 +}
 +
 +/*
@@ -516,10 +470,10 @@ IORTC when APPS owns the RTC write channel.
 +	publish(percent, mv, fLastMa, external, capable, charging, full, true, true);
 +	fPublished = true;
 +	IOLog("SURYA BATTERY: soc=%u.%02u%% v=%umV i=%dmA ocv=%umV vsoc=%u.%02u%% ext=%d chg=%d state=%u "
-+	    "full=%d start=%s %umV s7=%umV rtc0=%u rtcctl=%d now=%u\n",
++	    "full=%d start=%s %umV s7=%umV rtc0=%u clock=%d now=%u time=%ld\n",
 +	    soc100 / 100u, soc100 % 100u, mv, fLastMa, ocv / 1000u, vsoc100 / 100u, vsoc100 % 100u,
 +	    external, charging, state, full, fStartSource, fStartMv, fS7Mv, fRtcSec, fRtcCtrl,
-+	    surya_rtc_read());
++	    surya_rtc_read(), surya_time_get());
 +	suryaChargerLog();
 +}
 +
@@ -529,6 +483,9 @@ IORTC when APPS owns the RTC write channel.
  	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
  	if (self && self->fRunning) {
 +		if (self->fSurya) {
++			if (!self->fTimeDone) {
++				self->fTimeDone = surya_time_tick() != 0;
++			}
 +			self->suryaSample();
 +			if (++self->fTick % SURYA_PUBLISH_N == 0) {
 +				self->suryaPoll();

@@ -3,24 +3,22 @@ surya: SPMI access to the PM6150 RTC and the PM6150L WLED5
 Reads: the RTC seconds (SweetBattery logs them once) and the WLED5 control
 (0xd8) and sink (0xd9) blocks on SID 5; sweet_spmi_owner() reports which EE
 may write a peripheral. One write path, sweet_spmi_write(): only WLED5
-registers 0xd846, 0xd953, 0xd954, 0xd965 and PM6150 RTC 0x6040..0x6043,
-0x6046, only through the APPS-owned write
-channel (spmi-pmic-arb.c v5), for the backlight. Everything else stays
+registers 0xd846, 0xd953, 0xd954, 0xd965, only through the APPS-owned
+write channel (spmi-pmic-arb.c v5), for the backlight. Everything else stays
 read-only.
 
 --- a/bsd/dev/sweet_spmi.c
 +++ b/bsd/dev/sweet_spmi.c
-@@ -4,6 +4,9 @@
+@@ -4,6 +4,8 @@
   * No interrupt clear, peripheral enable, charger config, or PMIC writes.
   * Init is serialized by the single built-in SweetBattery personality.
   * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
 + * surya adds one exception, sweet_spmi_write(): four PM6150L WLED5 backlight
-+ * registers on SID 5 and five PM6150 RTC registers on SID 0, through the
-+ * APPS-owned write channel only.
++ * registers on SID 5, through the APPS-owned write channel only.
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <sys/param.h>
-@@ -83,14 +86,98 @@
+@@ -83,14 +85,94 @@
  	return 0;
  }
  
@@ -28,9 +26,8 @@ read-only.
 + * surya: one-byte PMIC write through the APPS write channel
 + * (spmi-pmic-arb.c, v5: chnls + 0x10000 * APID; WDATA0 +0x10; CMD +0x00 with
 + * EXT_WRITEL = 0 and BC = 0; STATUS +0x08 done/failure/denied/dropped). Only
-+ * the four PM6150L WLED5 registers the backlight needs and the five PM6150 RTC
-+ * registers that set the time, and only when the arbiter says APPS (EE 0)
-+ * owns the channel. Everything else stays read-only.
++ * the four PM6150L WLED5 registers the backlight needs, and only when the
++ * arbiter says APPS (EE 0) owns the channel. Everything else stays read-only.
 + */
 +#define SP_CHNLS_PA 0x0c600000u
 +
@@ -40,11 +37,8 @@ read-only.
 +sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value)
 +{
 +	static vm_offset_t chan[512];
-+	/* WLED5 backlight on SID 5; PM6150 RTC write data and control on SID 0. */
-+	bool wled = sid == 5 &&
-+	    (addr == 0xd846 || addr == 0xd953 || addr == 0xd954 || addr == 0xd965);
-+	bool rtc = sid == 0 && ((addr >= 0x6040 && addr <= 0x6043) || addr == 0x6046);
-+	if (!sp_ready || (!wled && !rtc)) {
++	if (!sp_ready || sid != 5 ||
++	    (addr != 0xd846 && addr != 0xd953 && addr != 0xd954 && addr != 0xd965)) {
 +		return -1;
 +	}
 +	IOLockLock(sp_lock);

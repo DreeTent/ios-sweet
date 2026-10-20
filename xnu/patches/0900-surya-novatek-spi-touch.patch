@@ -9,19 +9,29 @@ edge latched in TLMM (no CPU interrupt), with polling as fallback.
 Milestone 4: the points go to iOS through the sweet touch_report/SweetHID path.
 Also, with /surya-touch present: PE_halt_restart through PSCI SYSTEM_OFF and
 SYSTEM_RESET, so iOS "Shut Down" powers the phone off instead of spinning.
+And surya's wall clock: PM6150 RTC + an offset kept in
+/private/var/db/surya-time, written when iOS sets the time and applied once
+the root is mounted (the RTC itself is not writable from APPS).
 
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -14,6 +14,8 @@
+@@ -14,6 +14,15 @@
  #include <kern/sched_prim.h>
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
 +#include <IOKit/IOPlatformExpert.h> /* PE_halt_restart, kPE* (as bsd/kern/kern_shutdown.c) */
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include "sweet_spmi.h"
++
++/* bsd/sys/vnode_internal.h */
++extern struct vnode *rootvnode;
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  /* Mach MIG declaration is not included by BSD's exported thread.h. */
-@@ -635,6 +637,941 @@
+@@ -635,6 +644,1071 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -960,10 +970,140 @@ SYSTEM_RESET, so iOS "Shut Down" powers the phone off instead of spinning.
 +	printf("SURYA POWER: shut down and restart through PSCI\n");
 +}
 +
++/*
++ * surya wall clock (not touch code either; this file is surya's C home).
++ * The PM6150 RTC runs (seconds since about the first power-on in 2020), but
++ * its write channel is not owned by APPS, and Linux on surya never writes it
++ * (qpnp-rtc-write = 0): Android kept an offset in /data. Here the offset is
++ * kept in SURYA_TIME_FILE on the iOS root, by the user's choice (21.10):
++ *  - SweetPlatformExpert::setGMTTimeOfDay -> surya_time_set: iOS set the time,
++ *    store offset = time - RTC with the RTC value it was taken at;
++ *  - surya_time_tick, from SweetBattery's 1 s timer until it is done: once the
++ *    root is mounted, read the file and set the calendar to RTC + offset.
++ *    Until then (clock_initialize_calendar runs before the root is mounted)
++ *    surya_time_get answers 0, as before. An RTC behind the saved value means
++ *    the RTC was reset; the offset is then dropped.
++ */
++#define SURYA_TIME_FILE  "/private/var/db/surya-time"
++#define SURYA_TIME_MAGIC 0x53525443u /* "SRTC" */
++
++struct surya_time_rec {
++	uint32_t magic, version;
++	int64_t offset;
++	uint32_t rtc, reserved;
++};
++
++static int64_t surya_offset;
++static bool surya_offset_valid, surya_time_done, surya_time_restoring;
++
++long surya_time_get(void);
++void surya_time_set(long secs);
++int surya_time_tick(void);
++
++/* RTC_READ 0x6048..0x604b, re-read byte 0 for rollover (qpnp_rtc_read_time). */
++static uint32_t
++surya_rtc_now(void)
++{
++	for (unsigned attempt = 0; attempt < 3; ++attempt) {
++		uint8_t b[4], again;
++		bool ok = true;
++		for (unsigned i = 0; i < 4 && ok; ++i) {
++			ok = !sweet_spmi_read(0, 0x6048u + i, &b[i]);
++		}
++		if (!ok || sweet_spmi_read(0, 0x6048u, &again)) {
++			return 0xffffffffu;
++		}
++		if (again >= b[0]) {
++			return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
++			       ((uint32_t)b[3] << 24);
++		}
++	}
++	return 0xffffffffu;
++}
++
++static int
++surya_time_file(bool write, struct surya_time_rec *rec)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int fmode = write ? (O_CREAT | O_TRUNC | FWRITE) : FREAD;
++	int resid = 0;
++	int err = vnode_open(SURYA_TIME_FILE, fmode, 0600, 0, &vp, ctx);
++	if (err) {
++		return err;
++	}
++	err = vn_rdwr(write ? UIO_WRITE : UIO_READ, vp, (caddr_t)rec, (int)sizeof(*rec), 0,
++	    UIO_SYSSPACE, IO_NOAUTH | (write ? IO_SYNC : 0), vfs_context_ucred(ctx), &resid,
++	    vfs_context_proc(ctx));
++	(void)vnode_close(vp, write ? FWRITE : FREAD, ctx);
++	return err ? err : (resid ? EIO : 0);
++}
++
++long
++surya_time_get(void)
++{
++	uint32_t rtc = surya_rtc_now();
++	if (rtc == 0xffffffffu || !surya_offset_valid) {
++		return 0;
++	}
++	return (long)((int64_t)rtc + surya_offset);
++}
++
++void
++surya_time_set(long secs)
++{
++	uint32_t rtc = surya_rtc_now();
++	if (rtc == 0xffffffffu || secs <= 0) {
++		return;
++	}
++	surya_offset = (int64_t)secs - rtc;
++	surya_offset_valid = true;
++	if (surya_time_restoring) {
++		return; /* our own clock_set_calendar_microtime below */
++	}
++	struct surya_time_rec rec = {SURYA_TIME_MAGIC, 1, surya_offset, rtc, 0};
++	int err = rootvnode ? surya_time_file(true, &rec) : ENOENT;
++	printf("SURYA TIME: set %ld (rtc %u, offset %lld), saved err=%d\n",
++	    secs, rtc, (long long)surya_offset, err);
++}
++
++int
++surya_time_tick(void)
++{
++	if (surya_time_done) {
++		return 1;
++	}
++	if (!rootvnode) {
++		return 0;
++	}
++	surya_time_done = true;
++	struct surya_time_rec rec;
++	bzero(&rec, sizeof(rec));
++	int err = surya_time_file(false, &rec);
++	uint32_t rtc = surya_rtc_now();
++	if (err || rec.magic != SURYA_TIME_MAGIC || rec.version != 1 || rtc == 0xffffffffu) {
++		printf("SURYA TIME: no saved time (err=%d magic=%#x rtc=%u)\n", err, rec.magic, rtc);
++		return 1;
++	}
++	if (rtc < rec.rtc) {
++		printf("SURYA TIME: RTC went back (%u < %u): saved offset dropped\n", rtc, rec.rtc);
++		return 1;
++	}
++	surya_offset = rec.offset;
++	surya_offset_valid = true;
++	long secs = (long)((int64_t)rtc + surya_offset);
++	surya_time_restoring = true;
++	clock_set_calendar_microtime((clock_sec_t)secs, 0);
++	surya_time_restoring = false;
++	printf("SURYA TIME: restored %ld (rtc %u + offset %lld)\n", secs, rtc,
++	    (long long)surya_offset);
++	return 1;
++}
++
  void
  sweet_touch_init(void)
  {
-@@ -644,13 +1581,16 @@
+@@ -644,13 +1718,16 @@
  		return;
  	}
  	st.started = true;
