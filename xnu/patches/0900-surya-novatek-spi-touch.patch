@@ -12,8 +12,6 @@ SYSTEM_RESET, so iOS "Shut Down" powers the phone off instead of spinning.
 
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
---- a/bsd/dev/sweet_touch.c
-+++ b/bsd/dev/sweet_touch.c
 @@ -14,6 +14,8 @@
  #include <kern/sched_prim.h>
  #include <machine/machine_routines.h>
