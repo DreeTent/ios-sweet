@@ -10,10 +10,10 @@ node SweetBattery is unchanged for sweet.
 
 Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC;
 the PM6150 RTC seconds at start (needs 0902).
-Backlight step 1: an AppleARMBacklight observer (backlight-control = true),
-started from SweetBattery when the local ADT has /backlight; it logs what
-iOS sets and drives no hardware; it logs a read-only WLED5 snapshot and the
-write owner of its SPMI channels (needs 0902).
+Backlight: an AppleARMBacklight service (backlight-control = true), started
+from SweetBattery when the local ADT has /backlight. iOS's "brightness"
+(0..1024) drives the PM6150L WLED5 through sweet_spmi_write (0902): 0 turns
+the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
 
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
@@ -33,7 +33,7 @@ write owner of its SPMI channels (needs 0902).
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
-@@ -11,10 +20,27 @@
+@@ -11,10 +20,28 @@
  #include <IOKit/IOTimerEventSource.h>
  #include <IOKit/pwr_mgt/IOPMPowerSource.h>
  #include <libkern/c++/OSCollectionIterator.h>
@@ -46,6 +46,7 @@ write owner of its SPMI channels (needs 0902).
  extern "C" int sweet_spmi_init(void);
  extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
 +extern "C" int sweet_spmi_owner(unsigned sid, unsigned peripheral, unsigned *apid);
++extern "C" int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
 +extern "C" uint64_t mach_absolute_time(void);
 +extern "C" void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 +
@@ -61,7 +62,7 @@ write owner of its SPMI channels (needs 0902).
  
  class SweetBattery : public IOPMPowerSource {
  	OSDeclareDefaultStructors(SweetBattery);
-@@ -28,14 +54,37 @@
+@@ -28,14 +55,37 @@
  	IOTimerEventSource *fTimer;
  	bool fTimerAdded, fRunning, fReal;
  	int fLastMode;
@@ -99,7 +100,7 @@ write owner of its SPMI channels (needs 0902).
  	static unsigned estimatePercent(unsigned mv);
  };
  OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
-@@ -72,6 +121,18 @@
+@@ -72,6 +122,18 @@
  		}
  	}
  	fLastMode = -1;
@@ -118,7 +119,7 @@ write owner of its SPMI channels (needs 0902).
  	return true;
  }
  
-@@ -101,11 +162,11 @@
+@@ -101,11 +163,11 @@
  SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
      bool capable, bool charging, bool full, bool measured, bool currentValid)
  {
@@ -133,7 +134,7 @@ write owner of its SPMI channels (needs 0902).
  	setExternalConnected(external);
  	setExternalChargeCapable(capable);
  	setIsCharging(charging);
-@@ -119,8 +180,8 @@
+@@ -119,8 +181,8 @@
  	putBool("FullyCharged", full);
  	putBool("AppleRawExternalConnected", external);
  	putNumber("AppleRawCurrentCapacity", capacity);
@@ -144,7 +145,7 @@ write owner of its SPMI channels (needs 0902).
  	putNumber("InstantAmperage", (UInt32)ma);
  	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
  	putNumber("Temperature", 2500);
-@@ -137,7 +198,7 @@
+@@ -137,7 +199,7 @@
  		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
  		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
  		    kIOBatteryFlagsKey};
@@ -153,7 +154,7 @@ write owner of its SPMI channels (needs 0902).
  		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
  		    (charging ? kIOBatteryCharge : 0))};
  		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
-@@ -246,41 +307,472 @@
+@@ -246,41 +308,548 @@
  	    charging, full, true, currentValid);
  }
  
@@ -465,12 +466,17 @@ write owner of its SPMI channels (needs 0902).
  }
  
 +/*
-+ * surya, backlight step 1: an observer named like iPhone X's driver.
-+ * CoreBrightness/backboardd find it by backlight-control = true; the ADT
-+ * /backlight node comes from scripts/adt-backlight.py. It drives no hardware:
-+ * every property set on it, every message and user-client request is logged,
-+ * to learn what iOS sends before the WLED is touched. IODisplayParameters is
-+ * a guess in the macOS IODisplay shape; what iOS reads is part of the question.
++ * surya backlight, named like iPhone X's driver. CoreBrightness/backboardd find
++ * it by backlight-control = true; the ADT /backlight node comes from
++ * scripts/adt-backlight.py. Observed 20.10 (step 1): with IODisplayParameters
++ * brightness 0..1024 and no nits tables, iOS sends {brightness, backlight-level,
++ * FadePeriod}: 1..1014 from the slider, 0 on lock (then the framebuffer goes
++ * dark), the old level after unlock. So only "brightness" is acted on:
++ * 0 turns the PM6150L WLED5 module off, N > 0 sets level N * 4095 / 1024
++ * (at least 42, above the 1 % where Linux needs its sample-and-hold
++ * workaround) the way qcom-spmi-wled.c does: MOD_A brightness LSB/MSB,
++ * sync bit 0 set then bits 3:0 cleared, module enable with 10 ms soft start.
++ * Everything set on it is still logged, up to 600 lines.
 + */
 +class AppleARMBacklight : public IOService {
 +	OSDeclareDefaultStructors(AppleARMBacklight);
@@ -482,7 +488,12 @@ write owner of its SPMI channels (needs 0902).
 +	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 +private:
 +	unsigned fLines;
++	int fLevel;          /* WLED level now: 0 off, -1 unknown */
++	bool fSnapshotDone;
++	IOLock *fLock;
 +	void logObject(const char *what, OSObject *object);
++	void logSnapshot(void);
++	void applyBrightness(unsigned brightness);
 +};
 +OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
 +
@@ -502,6 +513,70 @@ write owner of its SPMI channels (needs 0902).
 +	OSSafeReleaseNULL(s);
 +}
 +
++/* Read-only WLED5 snapshot and who may write it; also sets fLevel. */
++void
++AppleARMBacklight::logSnapshot(void)
++{
++	unsigned capid = 0, sapid = 0;
++	int cown = sweet_spmi_owner(5, 0xd8, &capid), sown = sweet_spmi_owner(5, 0xd9, &sapid);
++	static const uint16_t regs[] = {0xd807, 0xd808, 0xd846, 0xd946, 0xd950, 0xd951, 0xd952,
++		                        0xd953, 0xd954, 0xd965, 0xd972, 0xd973};
++	uint8_t v[sizeof(regs) / sizeof(regs[0])];
++	bool ok = true;
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
++		if (sweet_spmi_read(5, regs[i], &v[i])) {
++			v[i] = 0xee;
++			ok = false;
++		}
++	}
++	if (ok) {
++		fLevel = (v[2] & 0x80u) ? (int)((((unsigned)v[8] & 0x0fu) << 8) | v[7]) : 0;
++	}
++	IOLog("SURYA BACKLIGHT: WLED ctrl apid %u owner %d, sink apid %u owner %d; "
++	    "status %#x fault %#x mod_en %#x | sink_en %#x modA_en %#x src %#x wid %#x "
++	    "brt %#x%02x sync %#x fs %#x %#x; level %d\n",
++	    capid, cown, sapid, sown, v[0], v[1], v[2], v[3], v[4], v[5], v[6],
++	    v[8], v[7], v[9], v[10], v[11], fLevel);
++}
++
++void
++AppleARMBacklight::applyBrightness(unsigned brightness)
++{
++	unsigned level = 0;
++	if (brightness) {
++		uint64_t l = (uint64_t)brightness * 4095u / 1024u;
++		level = l < 42u ? 42u : (l > 4095u ? 4095u : (unsigned)l);
++	}
++	if ((int)level == fLevel) {
++		return;
++	}
++	int err = 0;
++	uint8_t en = 0, sync = 0;
++	if (level) {
++		err |= sweet_spmi_write(5, 0xd953, (uint8_t)(level & 0xffu));
++		err |= sweet_spmi_write(5, 0xd954, (uint8_t)((level >> 8) & 0x0fu));
++		err |= sweet_spmi_read(5, 0xd965, &sync);
++		err |= sweet_spmi_write(5, 0xd965, (uint8_t)((sync & ~0x3u) | 0x1u));
++		err |= sweet_spmi_write(5, 0xd965, (uint8_t)(sync & ~0xfu));
++		if (fLevel <= 0) {
++			err |= sweet_spmi_read(5, 0xd846, &en);
++			if (!(en & 0x80u)) {
++				err |= sweet_spmi_write(5, 0xd846, (uint8_t)(en | 0x80u));
++				IOSleep(10); /* WLED_SOFT_START_DLY_US */
++			}
++		}
++	} else {
++		err |= sweet_spmi_read(5, 0xd846, &en);
++		err |= sweet_spmi_write(5, 0xd846, (uint8_t)(en & ~0x80u));
++	}
++	if (fLines < 600) {
++		++fLines;
++		IOLog("SURYA BACKLIGHT: brightness %u -> WLED level %u (was %d)%s\n",
++		    brightness, level, fLevel, err ? " FAILED" : "");
++	}
++	fLevel = err ? -1 : (int)level;
++}
++
 +bool
 +AppleARMBacklight::start(IOService *provider)
 +{
@@ -509,6 +584,12 @@ write owner of its SPMI channels (needs 0902).
 +		return false;
 +	}
 +	fLines = 0;
++	fLevel = -1;
++	fSnapshotDone = false;
++	fLock = IOLockAlloc();
++	if (!fLock) {
++		return false;
++	}
 +	setProperty("backlight-control", kOSBooleanTrue);
 +	OSDictionary *params = OSDictionary::withCapacity(1);
 +	OSDictionary *brightness = OSDictionary::withCapacity(3);
@@ -527,30 +608,26 @@ write owner of its SPMI channels (needs 0902).
 +	OSSafeReleaseNULL(brightness);
 +	OSSafeReleaseNULL(params);
 +	registerService();
-+	IOLog("SURYA BACKLIGHT: observer registered (backlight-control)\n");
-+	/* Read-only WLED5 snapshot (qcom-spmi-wled.c) and who may write it. */
-+	unsigned capid = 0, sapid = 0;
-+	int cown = sweet_spmi_owner(5, 0xd8, &capid), sown = sweet_spmi_owner(5, 0xd9, &sapid);
-+	static const uint16_t regs[] = {0xd807, 0xd808, 0xd846, 0xd946, 0xd950, 0xd951, 0xd952,
-+		                        0xd953, 0xd954, 0xd965, 0xd972, 0xd973};
-+	uint8_t v[sizeof(regs) / sizeof(regs[0])];
-+	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
-+		if (sweet_spmi_read(5, regs[i], &v[i])) {
-+			v[i] = 0xee;
-+		}
-+	}
-+	IOLog("SURYA BACKLIGHT: WLED ctrl apid %u owner %d, sink apid %u owner %d; "
-+	    "status %#x fault %#x mod_en %#x | sink_en %#x modA_en %#x src %#x wid %#x "
-+	    "brt %#x%02x sync %#x fs %#x %#x\n",
-+	    capid, cown, sapid, sown, v[0], v[1], v[2], v[3], v[4], v[5], v[6],
-+	    v[8], v[7], v[9], v[10], v[11]);
++	IOLog("SURYA BACKLIGHT: registered (backlight-control)\n");
 +	return true;
 +}
 +
 +IOReturn
 +AppleARMBacklight::setProperties(OSObject *properties)
 +{
++	IOLockLock(fLock);
++	if (!fSnapshotDone) {
++		/* At start the USB log is not up yet: take the snapshot here. */
++		fSnapshotDone = true;
++		logSnapshot();
++	}
 +	logObject("setProperties", properties);
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	OSNumber *b = dict ? OSDynamicCast(OSNumber, dict->getObject("brightness")) : NULL;
++	if (b) {
++		applyBrightness(b->unsigned32BitValue());
++	}
++	IOLockUnlock(fLock);
 +	return kIOReturnSuccess;
 +}
 +

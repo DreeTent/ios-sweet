@@ -1,0 +1,118 @@
+surya: SPMI access to the PM6150 RTC and the PM6150L WLED5
+
+Reads: the RTC seconds (SweetBattery logs them once) and the WLED5 control
+(0xd8) and sink (0xd9) blocks on SID 5; sweet_spmi_owner() reports which EE
+may write a peripheral. One write path, sweet_spmi_write(): only WLED5
+registers 0xd846, 0xd953, 0xd954, 0xd965, only through the APPS-owned write
+channel (spmi-pmic-arb.c v5), for the backlight. Everything else stays
+read-only.
+
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -4,6 +4,8 @@
+  * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+  * Init is serialized by the single built-in SweetBattery personality.
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
++ * surya adds one exception, sweet_spmi_write(): four PM6150L WLED5 backlight
++ * registers on SID 5, through the APPS-owned write channel only.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -83,14 +85,94 @@
+ 	return 0;
+ }
+ 
++/*
++ * surya backlight: one-byte PMIC write through the APPS write channel
++ * (spmi-pmic-arb.c, v5: chnls + 0x10000 * APID; WDATA0 +0x10; CMD +0x00 with
++ * EXT_WRITEL = 0 and BC = 0; STATUS +0x08 done/failure/denied/dropped). Only
++ * the four PM6150L WLED5 registers the backlight needs, and only when the
++ * arbiter says APPS (EE 0) owns the channel. Everything else stays read-only.
++ */
++#define SP_CHNLS_PA 0x0c600000u
++
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
++
++int
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value)
++{
++	static vm_offset_t chan[512];
++	if (!sp_ready || sid != 5 ||
++	    (addr != 0xd846 && addr != 0xd953 && addr != 0xd954 && addr != 0xd965)) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
++	if (apid == SP_NO_APID || sp_poisoned[apid] ||
++	    (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	if (!chan[apid]) {
++		chan[apid] = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++	}
++	vm_offset_t ch = chan[apid];
++	if (!ch) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	*(volatile uint32_t *)(ch + 0x10u) = value;              /* WDATA0 */
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x00u) = (addr & 0xffu) << 4; /* EXT_WRITEL, BC = 0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(ch, 0x08u);
++		if (status & 1u) {
++			IOLockUnlock(sp_lock);
++			return (status & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	printf("SURYA SPMI: write timeout sid=%u addr=%#x APID=%u disabled\n", sid, addr, apid);
++	IOLockUnlock(sp_lock);
++	return -1;
++}
++
++/*
++ * The APID that owns (sid, peripheral) and its write owner EE (cnfg + 0x700,
++ * bits 2:0, as spmi-pmic-arb.c's write_ee), or -1. Read-only bookkeeping:
++ * Linux writes a peripheral only when that owner is its own EE (0 = APPS).
++ * Declared here, not in sweet_spmi.h, to leave sweet's header untouched.
++ */
++int sweet_spmi_owner(unsigned sid, unsigned peripheral, unsigned *apid);
++
++int
++sweet_spmi_owner(unsigned sid, unsigned peripheral, unsigned *apid)
++{
++	if (!sp_ready || sid > 15 || peripheral > 0xff) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t a = sp_find_apid((sid << 8) | peripheral);
++	int owner = a == SP_NO_APID ? -1 : (int)(sp_rd(sp_cfg, 0x700u + 4u * a) & 7u);
++	IOLockUnlock(sp_lock);
++	if (apid) {
++		*apid = a;
++	}
++	return owner;
++}
++
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	bool sid0 = sid == 0 &&
++	    (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
++	    peripheral == 0x13 || peripheral == 0x48 ||
++	    peripheral == 0x60); /* 0x60: PM6150 RTC_RW, read by surya's battery log */
++	/* surya: PM6150L WLED5 control and sink on SID 5, for the backlight. */
++	bool sid5 = sid == 5 && (peripheral == 0xd8 || peripheral == 0xd9);
++	if (!sp_ready || !out || addr > 0xffffu || (!sid0 && !sid5)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
