@@ -12,6 +12,8 @@ SYSTEM_RESET, so iOS "Shut Down" powers the phone off instead of spinning.
 
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
 @@ -14,6 +14,8 @@
  #include <kern/sched_prim.h>
  #include <machine/machine_routines.h>
@@ -21,7 +23,7 @@ SYSTEM_RESET, so iOS "Shut Down" powers the phone off instead of spinning.
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  /* Mach MIG declaration is not included by BSD's exported thread.h. */
-@@ -635,6 +637,940 @@
+@@ -635,6 +637,941 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -895,8 +897,9 @@ SYSTEM_RESET, so iOS "Shut Down" powers the phone off instead of spinning.
 + * -1 and halt_all_cpus() spins forever: iOS "Shut Down" froze the screen and
 + * drained the battery to empty. PSCI 1.1 via SMC is what the Qualcomm TZ
 + * offers (CPU_ON already used by the SMP patch; SYSTEM_RESET used by the shim).
-+ * The UFS driver issues no SYNCHRONIZE CACHE, so power is cut only after a
-+ * 3 s idle pause, by which point launchd has synced and unmounted.
++ * By the time halt is requested launchd has synced the volumes, and HFS's
++ * DKIOCSYNCHRONIZE makes sweet_ufs send SYNCHRONIZE CACHE(10); power is cut
++ * 3 s later as a margin.
 + */
 +#define PSCI_SYSTEM_OFF   0x84000008ULL
 +#define PSCI_SYSTEM_RESET 0x84000009ULL
@@ -962,7 +965,7 @@ SYSTEM_RESET, so iOS "Shut Down" powers the phone off instead of spinning.
  void
  sweet_touch_init(void)
  {
-@@ -644,13 +1580,16 @@
+@@ -644,13 +1581,16 @@
  		return;
  	}
  	st.started = true;
