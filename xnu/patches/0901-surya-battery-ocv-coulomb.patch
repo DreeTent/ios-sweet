@@ -2,7 +2,8 @@ surya: battery SOC from the power-on OCV and a coulomb counter
 
 Only when the locally built ADT has /surya-battery (capacity and the 25 C
 OCV-by-SOC column of the surya battery profile): start SOC from the QG's
-S7_PON_OCV through that table, then the battery current sampled every second
+S7_PON_OCV (only if it agrees with V - I*R now) through that table, then
+the battery current sampled every second
 is integrated; publish and log every 30 s; SMB5 termination sets 100%; a
 failed read keeps the last values instead of the 100% fallback. Without the
 node SweetBattery is unchanged for sweet.
@@ -28,7 +29,7 @@ the PM6150 RTC seconds at start (needs 0902).
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
-@@ -12,9 +21,19 @@
+@@ -12,9 +21,24 @@
  #include <IOKit/pwr_mgt/IOPMPowerSource.h>
  #include <libkern/c++/OSCollectionIterator.h>
  #include <pexpert/pexpert.h>
@@ -45,10 +46,15 @@ the PM6150 RTC seconds at start (needs 0902).
 +#define SURYA_SAMPLE_MS   1000u
 +#define SURYA_PUBLISH_N   30u   /* samples per publish: 30 s, as sweet */
 +#define QG_V_RAW_TO_UV(r) ((unsigned)(((uint64_t)(r) * 194637u) / 1000u)) /* qg-defs.h */
++/* Assumed cell + path resistance for OCV = V - I*R. Not measured: an estimate. */
++#define SURYA_RBATT_MOHM  100
++#define SURYA_S7_MATCH_UV 100000u /* S7 must agree with the load-corrected OCV */
++#define SURYA_NUDGE_DIV   64      /* pull toward the voltage SOC by 1/64 per poll */
++#define SURYA_NUDGE_MAX   50u     /* ... but at most 0.50 % per poll */
  
  class SweetBattery : public IOPMPowerSource {
  	OSDeclareDefaultStructors(SweetBattery);
-@@ -28,14 +47,36 @@
+@@ -28,14 +52,37 @@
  	IOTimerEventSource *fTimer;
  	bool fTimerAdded, fRunning, fReal;
  	int fLastMode;
@@ -56,7 +62,7 @@ the PM6150 RTC seconds at start (needs 0902).
 +	/* surya: OCV table from the ADT and the coulomb counter. */
 +	bool fSurya, fSuryaValid, fPublished;
 +	const uint32_t *fOcvPct, *fOcvUv;
-+	unsigned fOcvCount, fTick, fStartMv, fFailures;
++	unsigned fOcvCount, fTick, fStartMv, fFailures, fS7Mv;
 +	uint8_t fSubtype;
 +	const char *fStartSource;
 +	int64_t fChargeNah, fCapNah;
@@ -77,6 +83,7 @@ the PM6150 RTC seconds at start (needs 0902).
 +	void suryaSample(void);
 +	void suryaPoll(void);
 +	unsigned suryaSoc100(unsigned uv) const;
++	unsigned suryaOcvNow(void) const;
 +	bool suryaCurrent(int *ma) const;
  	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
  	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
@@ -85,14 +92,14 @@ the PM6150 RTC seconds at start (needs 0902).
  	static unsigned estimatePercent(unsigned mv);
  };
  OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
-@@ -72,6 +113,18 @@
+@@ -72,6 +119,18 @@
  		}
  	}
  	fLastMode = -1;
 +	fDesignMah = 5020;
 +	fSurya = fSuryaValid = fPublished = false;
 +	fOcvPct = fOcvUv = NULL;
-+	fOcvCount = fTick = fStartMv = fFailures = 0;
++	fOcvCount = fTick = fStartMv = fFailures = fS7Mv = 0;
 +	fSubtype = 0;
 +	fStartSource = "none";
 +	fChargeNah = fCapNah = 0;
@@ -104,7 +111,7 @@ the PM6150 RTC seconds at start (needs 0902).
  	return true;
  }
  
-@@ -101,11 +154,11 @@
+@@ -101,11 +160,11 @@
  SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
      bool capable, bool charging, bool full, bool measured, bool currentValid)
  {
@@ -119,7 +126,7 @@ the PM6150 RTC seconds at start (needs 0902).
  	setExternalConnected(external);
  	setExternalChargeCapable(capable);
  	setIsCharging(charging);
-@@ -119,8 +172,8 @@
+@@ -119,8 +178,8 @@
  	putBool("FullyCharged", full);
  	putBool("AppleRawExternalConnected", external);
  	putNumber("AppleRawCurrentCapacity", capacity);
@@ -130,7 +137,7 @@ the PM6150 RTC seconds at start (needs 0902).
  	putNumber("InstantAmperage", (UInt32)ma);
  	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
  	putNumber("Temperature", 2500);
-@@ -137,7 +190,7 @@
+@@ -137,7 +196,7 @@
  		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
  		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
  		    kIOBatteryFlagsKey};
@@ -139,7 +146,7 @@ the PM6150 RTC seconds at start (needs 0902).
  		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
  		    (charging ? kIOBatteryCharge : 0))};
  		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
-@@ -246,11 +299,281 @@
+@@ -246,11 +305,308 @@
  	    charging, full, true, currentValid);
  }
  
@@ -224,25 +231,44 @@ the PM6150 RTC seconds at start (needs 0902).
 +}
 +
 +/*
-+ * Start SOC: the QG's power-on OCV (qg_determine_pon_soc's S7_PON_OCV), taken
-+ * before the load. Every surya bring-up begins with a PMIC reset (keys to
-+ * fastboot), so it is fresh. Fallback: the loaded voltage now, same table.
++ * Start SOC. The QG's power-on OCV (qg_determine_pon_soc's S7_PON_OCV) is a
++ * no-load reading, but only from the last cold power-on: the keys-to-fastboot
++ * reset does not repeat it (20.10: S7 3425 mV with the cell at 4190 mV). So S7
++ * is used only when it agrees with the present voltage corrected for the
++ * load (V - I*R); otherwise that corrected voltage is the start. Same table.
 + */
++unsigned
++SweetBattery::suryaOcvNow(void) const
++{
++	uint16_t raw;
++	if (!readWordHL(0x48c0, &raw) || !raw || raw == 0x8000) {
++		return 0;
++	}
++	int64_t uv = (int64_t)QG_V_RAW_TO_UV(raw) - (int64_t)fLastMa * SURYA_RBATT_MOHM;
++	return uv > 0 ? (unsigned)uv : 0;
++}
++
 +void
 +SweetBattery::suryaStart(void)
 +{
 +	uint16_t raw = 0;
-+	unsigned uv = 0;
-+	fStartSource = "S7_PON_OCV";
-+	if (readWord(0x4870, &raw) && raw && raw != 0x8000) {
-+		uv = QG_V_RAW_TO_UV(raw);
++	unsigned s7 = 0, now, uv;
++	int ma;
++	if (suryaCurrent(&ma)) {
++		fLastMa = ma;
 +	}
-+	if (uv < 3000000u || uv > 4500000u) {
-+		fStartSource = "LAST_ADC_V";
-+		uv = 0;
-+		if (readWordHL(0x48c0, &raw) && raw && raw != 0x8000) {
-+			uv = QG_V_RAW_TO_UV(raw);
-+		}
++	if (readWord(0x4870, &raw) && raw && raw != 0x8000) {
++		s7 = QG_V_RAW_TO_UV(raw);
++	}
++	now = suryaOcvNow();
++	fS7Mv = s7 / 1000u;
++	if (s7 >= 3000000u && s7 <= 4500000u && now &&
++	    (s7 > now ? s7 - now : now - s7) <= SURYA_S7_MATCH_UV) {
++		fStartSource = "S7_PON_OCV";
++		uv = s7;
++	} else {
++		fStartSource = "V-IR";
++		uv = now;
 +	}
 +	if (uv < 3000000u || uv > 4500000u) {
 +		fStartSource = "none";
@@ -301,14 +327,14 @@ the PM6150 RTC seconds at start (needs 0902).
 +			ok = !sweet_spmi_read(0, 0x6040u + i, &b[i]);
 +		}
 +		if (!ok || sweet_spmi_read(0, 0x6040u, &again)) {
-+			return 0;
++			return 0xffffffffu; /* read failed, as opposed to a zero counter */
 +		}
 +		if (again >= b[0]) {
 +			return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
 +			       ((uint32_t)b[3] << 24);
 +		}
 +	}
-+	return 0;
++	return 0xffffffffu;
 +}
 +
 +/*
@@ -391,17 +417,25 @@ the PM6150 RTC seconds at start (needs 0902).
 +	bool charging = capable && state >= 1 && state <= 4 &&
 +	    !(error & 2u) && !(temperature & 0x0cu);
 +	bool full = external && state == 5 && !(error & 2u);
++	unsigned ocv = suryaOcvNow(), vsoc100 = ocv ? suryaSoc100(ocv) : 0;
 +	if (full) {
 +		fChargeNah = fCapNah; /* SMB5 terminated the charge */
++	} else if (ocv) {
++		/* Slow pull toward the load-corrected voltage, so a wrong start or
++		 * counter drift heals without a visible jump. */
++		int64_t target = fCapNah * vsoc100 / 10000, step = (target - fChargeNah) / SURYA_NUDGE_DIV;
++		int64_t cap = fCapNah * SURYA_NUDGE_MAX / 10000;
++		fChargeNah += step > cap ? cap : (step < -cap ? -cap : step);
 +	}
 +	unsigned soc100 = (unsigned)(fChargeNah * 10000 / fCapNah);
 +	unsigned percent = (soc100 + 50u) / 100u;
 +	percent = percent < 1u ? 1u : (percent > 100u ? 100u : percent);
 +	publish(percent, mv, fLastMa, external, capable, charging, full, true, true);
 +	fPublished = true;
-+	IOLog("SURYA BATTERY: soc=%u.%02u%% v=%umV i=%dmA ext=%d chg=%d state=%u full=%d start=%s %umV rtc0=%u\n",
-+	    soc100 / 100u, soc100 % 100u, mv, fLastMa, external, charging, state, full,
-+	    fStartSource, fStartMv, fRtcSec);
++	IOLog("SURYA BATTERY: soc=%u.%02u%% v=%umV i=%dmA ocv=%umV vsoc=%u.%02u%% ext=%d chg=%d state=%u "
++	    "full=%d start=%s %umV s7=%umV rtc0=%#x\n",
++	    soc100 / 100u, soc100 % 100u, mv, fLastMa, ocv / 1000u, vsoc100 / 100u, vsoc100 % 100u,
++	    external, charging, state, full, fStartSource, fStartMv, fS7Mv, fRtcSec);
 +	suryaChargerLog();
 +}
 +
@@ -421,7 +455,7 @@ the PM6150 RTC seconds at start (needs 0902).
  		self->poll();
  		sender->setTimeoutMS(30000);
  	}
-@@ -262,20 +585,33 @@
+@@ -262,20 +618,33 @@
  	if (!IOPMPowerSource::start(provider)) {
  		return false;
  	}
