@@ -1,4 +1,4 @@
-surya: Novatek NT36672C over GENI SE0 SPI, milestones 1-4
+surya: Novatek NT36672C over GENI SE0 SPI, milestones 1-4; PSCI power off
 
 sweettouch=2 selects it. Milestone 1: clocks, pins, SPI, bootloader reset,
 chip id. Milestone 2: firmware download with the chip's hardware CRC, as
@@ -7,18 +7,21 @@ not in this tree: the locally built ADT carries it as /surya-touch "firmware".
 Milestone 3: finger points from the event buffer; reads are paced by gpio9's
 edge latched in TLMM (no CPU interrupt), with polling as fallback.
 Milestone 4: the points go to iOS through the sweet touch_report/SweetHID path.
+Also, with /surya-touch present: PE_halt_restart through PSCI SYSTEM_OFF and
+SYSTEM_RESET, so iOS "Shut Down" powers the phone off instead of spinning.
 
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -14,6 +14,7 @@
+@@ -14,6 +14,8 @@
  #include <kern/sched_prim.h>
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
++#include <IOKit/IOPlatformExpert.h> /* PE_halt_restart, kPE* (as bsd/kern/kern_shutdown.c) */
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  /* Mach MIG declaration is not included by BSD's exported thread.h. */
-@@ -635,6 +636,869 @@
+@@ -635,6 +637,940 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -885,10 +888,88 @@ Milestone 4: the points go to iOS through the sweet touch_report/SweetHID path.
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
 +
++/*
++ * surya power off / restart. It lives here only because this file is the one
++ * surya driver that is already started at boot; it is not touch code.
++ * Without a platform PE_halt_restart, IOPlatformExpert::haltRestart returns
++ * -1 and halt_all_cpus() spins forever: iOS "Shut Down" froze the screen and
++ * drained the battery to empty. PSCI 1.1 via SMC is what the Qualcomm TZ
++ * offers (CPU_ON already used by the SMP patch; SYSTEM_RESET used by the shim).
++ * The UFS driver issues no SYNCHRONIZE CACHE, so power is cut only after a
++ * 3 s idle pause, by which point launchd has synced and unmounted.
++ */
++#define PSCI_SYSTEM_OFF   0x84000008ULL
++#define PSCI_SYSTEM_RESET 0x84000009ULL
++
++static int32_t
++surya_psci(uint64_t fn)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int32_t)x0;
++}
++
++static int
++surya_halt_restart(unsigned int type)
++{
++	uint64_t fn;
++	switch (type) {
++	case kPEHaltCPU:
++	case kPEUPSDelayHaltCPU:
++		printf("SURYA POWER: halt -> PSCI SYSTEM_OFF in 3 s\n");
++		delay(3000000);
++		fn = PSCI_SYSTEM_OFF;
++		break;
++	case kPERestartCPU:
++		printf("SURYA POWER: restart -> PSCI SYSTEM_RESET in 3 s\n");
++		delay(3000000);
++		fn = PSCI_SYSTEM_RESET;
++		break;
++	case kPEPanicRestartCPU:
++		/* Keep the panic visible in the logs and on screen for a while. */
++		printf("SURYA POWER: panic -> PSCI SYSTEM_RESET in 30 s\n");
++		delay(30000000);
++		fn = PSCI_SYSTEM_RESET;
++		break;
++	default:
++		return 0; /* panic callouts, paging off: nothing to do here */
++	}
++	int32_t rc = surya_psci(fn);
++	printf("SURYA POWER: PSCI %#llx returned %d\n", (unsigned long long)fn, rc);
++	return -1;
++}
++
++static void
++surya_power_init(void)
++{
++	DTEntry node;
++	int on = 1;
++	(void)PE_parse_boot_argn("suryapower", &on, sizeof(on));
++	/* /surya-touch exists only in surya's locally built ADT. */
++	if (!on || PE_halt_restart ||
++	    SecureDTLookupEntry(NULL, "/surya-touch", &node) != kSuccess) {
++		return;
++	}
++	PE_halt_restart = surya_halt_restart;
++	printf("SURYA POWER: shut down and restart through PSCI\n");
++}
++
  void
  sweet_touch_init(void)
  {
-@@ -650,7 +1514,9 @@
+@@ -644,13 +1580,16 @@
+ 		return;
+ 	}
+ 	st.started = true;
++	surya_power_init();
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+ 	if (!enabled) {
  		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
  		return;
  	}
