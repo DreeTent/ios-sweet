@@ -7,7 +7,8 @@ is integrated; publish and log every 30 s; SMB5 termination sets 100%; a
 failed read keeps the last values instead of the 100% fallback. Without the
 node SweetBattery is unchanged for sweet.
 
-Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC.
+Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC;
+the PM6150 RTC seconds at start (needs 0902).
 
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
@@ -47,7 +48,7 @@ Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC.
  
  class SweetBattery : public IOPMPowerSource {
  	OSDeclareDefaultStructors(SweetBattery);
-@@ -28,14 +47,34 @@
+@@ -28,14 +47,36 @@
  	IOTimerEventSource *fTimer;
  	bool fTimerAdded, fRunning, fReal;
  	int fLastMode;
@@ -63,7 +64,9 @@ Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC.
 +	int fLastMa;
 +	uint8_t fChgLast[11];
 +	bool fChgLogged;
++	uint32_t fRtcSec;
 +	void suryaChargerLog(void);
++	static uint32_t suryaRtc(void);
  	void putNumber(const char *key, UInt32 value);
  	void putBool(const char *key, bool value);
  	void publish(unsigned percent, unsigned mv, int ma, bool external,
@@ -82,7 +85,7 @@ Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC.
  	static unsigned estimatePercent(unsigned mv);
  };
  OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
-@@ -72,6 +111,17 @@
+@@ -72,6 +113,18 @@
  		}
  	}
  	fLastMode = -1;
@@ -97,10 +100,11 @@ Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC.
 +	fLastMa = 0;
 +	bzero(fChgLast, sizeof(fChgLast));
 +	fChgLogged = false;
++	fRtcSec = 0;
  	return true;
  }
  
-@@ -101,11 +151,11 @@
+@@ -101,11 +154,11 @@
  SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
      bool capable, bool charging, bool full, bool measured, bool currentValid)
  {
@@ -115,7 +119,7 @@ Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC.
  	setExternalConnected(external);
  	setExternalChargeCapable(capable);
  	setIsCharging(charging);
-@@ -119,8 +169,8 @@
+@@ -119,8 +172,8 @@
  	putBool("FullyCharged", full);
  	putBool("AppleRawExternalConnected", external);
  	putNumber("AppleRawCurrentCapacity", capacity);
@@ -126,7 +130,7 @@ Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC.
  	putNumber("InstantAmperage", (UInt32)ma);
  	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
  	putNumber("Temperature", 2500);
-@@ -137,7 +187,7 @@
+@@ -137,7 +190,7 @@
  		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
  		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
  		    kIOBatteryFlagsKey};
@@ -135,7 +139,7 @@ Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC.
  		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
  		    (charging ? kIOBatteryCharge : 0))};
  		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
-@@ -246,11 +296,254 @@
+@@ -246,11 +299,281 @@
  	    charging, full, true, currentValid);
  }
  
@@ -245,6 +249,7 @@ Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC.
 +		return;
 +	}
 +	fStartMv = uv / 1000u;
++	fRtcSec = suryaRtc();
 +	fChargeNah = fCapNah * suryaSoc100(uv) / 10000;
 +	fLastAbs = mach_absolute_time();
 +	fSuryaValid = true;
@@ -278,6 +283,32 @@ Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC.
 +	} else if (fChargeNah > fCapNah) {
 +		fChargeNah = fCapNah;
 +	}
++}
++
++/*
++ * PM6150 RTC seconds (RTC_RW 0x6040..0x6043, as rtc-pm8xxx: read the four
++ * bytes, re-read byte 0 and retry on rollover). Surya's DT forbids Linux
++ * from writing it (qpnp-rtc-write = 0), so whether it is epoch time is what
++ * this log is for; XNU itself gets 0 from the generic platform expert.
++ */
++uint32_t
++SweetBattery::suryaRtc(void)
++{
++	for (unsigned attempt = 0; attempt < 3; ++attempt) {
++		uint8_t b[4], again;
++		bool ok = true;
++		for (unsigned i = 0; i < 4 && ok; ++i) {
++			ok = !sweet_spmi_read(0, 0x6040u + i, &b[i]);
++		}
++		if (!ok || sweet_spmi_read(0, 0x6040u, &again)) {
++			return 0;
++		}
++		if (again >= b[0]) {
++			return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
++			       ((uint32_t)b[3] << 24);
++		}
++	}
++	return 0;
 +}
 +
 +/*
@@ -368,9 +399,9 @@ Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC.
 +	percent = percent < 1u ? 1u : (percent > 100u ? 100u : percent);
 +	publish(percent, mv, fLastMa, external, capable, charging, full, true, true);
 +	fPublished = true;
-+	IOLog("SURYA BATTERY: soc=%u.%02u%% v=%umV i=%dmA ext=%d chg=%d state=%u full=%d start=%s %umV\n",
++	IOLog("SURYA BATTERY: soc=%u.%02u%% v=%umV i=%dmA ext=%d chg=%d state=%u full=%d start=%s %umV rtc0=%u\n",
 +	    soc100 / 100u, soc100 % 100u, mv, fLastMa, external, charging, state, full,
-+	    fStartSource, fStartMv);
++	    fStartSource, fStartMv, fRtcSec);
 +	suryaChargerLog();
 +}
 +
@@ -390,7 +421,7 @@ Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC.
  		self->poll();
  		sender->setTimeoutMS(30000);
  	}
-@@ -262,20 +555,33 @@
+@@ -262,20 +585,33 @@
  	if (!IOPMPowerSource::start(provider)) {
  		return false;
  	}

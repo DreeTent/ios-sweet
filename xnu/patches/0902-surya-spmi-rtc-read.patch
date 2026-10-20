@@ -1,0 +1,17 @@
+surya: allow read-only SPMI access to the PM6150 RTC
+
+SweetBattery logs the RTC seconds once at start to learn whether surya's
+RTC (not writable from Linux per its DT) holds epoch time. Reads only.
+
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -90,7 +90,8 @@
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48 &&
++	    peripheral != 0x60)) { /* 0x60: PM6150 RTC_RW, read by surya's battery log */
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
