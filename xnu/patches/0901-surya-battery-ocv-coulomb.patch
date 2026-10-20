@@ -12,7 +12,8 @@ Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC;
 the PM6150 RTC seconds at start (needs 0902).
 Backlight step 1: an AppleARMBacklight observer (backlight-control = true),
 started from SweetBattery when the local ADT has /backlight; it logs what
-iOS sets and drives no hardware.
+iOS sets and drives no hardware; it logs a read-only WLED5 snapshot and the
+write owner of its SPMI channels (needs 0902).
 
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
@@ -32,7 +33,7 @@ iOS sets and drives no hardware.
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
-@@ -11,10 +20,26 @@
+@@ -11,10 +20,27 @@
  #include <IOKit/IOTimerEventSource.h>
  #include <IOKit/pwr_mgt/IOPMPowerSource.h>
  #include <libkern/c++/OSCollectionIterator.h>
@@ -44,6 +45,7 @@ iOS sets and drives no hardware.
  /* bsd/dev/sweet_spmi.c */
  extern "C" int sweet_spmi_init(void);
  extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" int sweet_spmi_owner(unsigned sid, unsigned peripheral, unsigned *apid);
 +extern "C" uint64_t mach_absolute_time(void);
 +extern "C" void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 +
@@ -59,7 +61,7 @@ iOS sets and drives no hardware.
  
  class SweetBattery : public IOPMPowerSource {
  	OSDeclareDefaultStructors(SweetBattery);
-@@ -28,14 +53,37 @@
+@@ -28,14 +54,37 @@
  	IOTimerEventSource *fTimer;
  	bool fTimerAdded, fRunning, fReal;
  	int fLastMode;
@@ -97,7 +99,7 @@ iOS sets and drives no hardware.
  	static unsigned estimatePercent(unsigned mv);
  };
  OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
-@@ -72,6 +120,18 @@
+@@ -72,6 +121,18 @@
  		}
  	}
  	fLastMode = -1;
@@ -116,7 +118,7 @@ iOS sets and drives no hardware.
  	return true;
  }
  
-@@ -101,11 +161,11 @@
+@@ -101,11 +162,11 @@
  SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
      bool capable, bool charging, bool full, bool measured, bool currentValid)
  {
@@ -131,7 +133,7 @@ iOS sets and drives no hardware.
  	setExternalConnected(external);
  	setExternalChargeCapable(capable);
  	setIsCharging(charging);
-@@ -119,8 +179,8 @@
+@@ -119,8 +180,8 @@
  	putBool("FullyCharged", full);
  	putBool("AppleRawExternalConnected", external);
  	putNumber("AppleRawCurrentCapacity", capacity);
@@ -142,7 +144,7 @@ iOS sets and drives no hardware.
  	putNumber("InstantAmperage", (UInt32)ma);
  	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
  	putNumber("Temperature", 2500);
-@@ -137,7 +197,7 @@
+@@ -137,7 +198,7 @@
  		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
  		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
  		    kIOBatteryFlagsKey};
@@ -151,7 +153,7 @@ iOS sets and drives no hardware.
  		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
  		    (charging ? kIOBatteryCharge : 0))};
  		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
-@@ -246,41 +306,456 @@
+@@ -246,41 +307,472 @@
  	    charging, full, true, currentValid);
  }
  
@@ -526,6 +528,22 @@ iOS sets and drives no hardware.
 +	OSSafeReleaseNULL(params);
 +	registerService();
 +	IOLog("SURYA BACKLIGHT: observer registered (backlight-control)\n");
++	/* Read-only WLED5 snapshot (qcom-spmi-wled.c) and who may write it. */
++	unsigned capid = 0, sapid = 0;
++	int cown = sweet_spmi_owner(5, 0xd8, &capid), sown = sweet_spmi_owner(5, 0xd9, &sapid);
++	static const uint16_t regs[] = {0xd807, 0xd808, 0xd846, 0xd946, 0xd950, 0xd951, 0xd952,
++		                        0xd953, 0xd954, 0xd965, 0xd972, 0xd973};
++	uint8_t v[sizeof(regs) / sizeof(regs[0])];
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
++		if (sweet_spmi_read(5, regs[i], &v[i])) {
++			v[i] = 0xee;
++		}
++	}
++	IOLog("SURYA BACKLIGHT: WLED ctrl apid %u owner %d, sink apid %u owner %d; "
++	    "status %#x fault %#x mod_en %#x | sink_en %#x modA_en %#x src %#x wid %#x "
++	    "brt %#x%02x sync %#x fs %#x %#x\n",
++	    capid, cown, sapid, sown, v[0], v[1], v[2], v[3], v[4], v[5], v[6],
++	    v[8], v[7], v[9], v[10], v[11]);
 +	return true;
 +}
 +
