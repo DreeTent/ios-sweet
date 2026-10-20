@@ -10,6 +10,9 @@ node SweetBattery is unchanged for sweet.
 
 Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC;
 the PM6150 RTC seconds at start (needs 0902).
+Backlight step 1: an AppleARMBacklight observer (backlight-control = true),
+started from SweetBattery when the local ADT has /backlight; it logs what
+iOS sets and drives no hardware.
 
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
@@ -29,9 +32,11 @@ the PM6150 RTC seconds at start (needs 0902).
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
-@@ -12,9 +21,24 @@
+@@ -11,10 +20,26 @@
+ #include <IOKit/IOTimerEventSource.h>
  #include <IOKit/pwr_mgt/IOPMPowerSource.h>
  #include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSSerialize.h>
  #include <pexpert/pexpert.h>
 +extern "C" {
 +#include <pexpert/device_tree.h> /* SecureDT* have C linkage */
@@ -54,7 +59,7 @@ the PM6150 RTC seconds at start (needs 0902).
  
  class SweetBattery : public IOPMPowerSource {
  	OSDeclareDefaultStructors(SweetBattery);
-@@ -28,14 +52,37 @@
+@@ -28,14 +53,37 @@
  	IOTimerEventSource *fTimer;
  	bool fTimerAdded, fRunning, fReal;
  	int fLastMode;
@@ -92,7 +97,7 @@ the PM6150 RTC seconds at start (needs 0902).
  	static unsigned estimatePercent(unsigned mv);
  };
  OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
-@@ -72,6 +119,18 @@
+@@ -72,6 +120,18 @@
  		}
  	}
  	fLastMode = -1;
@@ -111,7 +116,7 @@ the PM6150 RTC seconds at start (needs 0902).
  	return true;
  }
  
-@@ -101,11 +160,11 @@
+@@ -101,11 +161,11 @@
  SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
      bool capable, bool charging, bool full, bool measured, bool currentValid)
  {
@@ -126,7 +131,7 @@ the PM6150 RTC seconds at start (needs 0902).
  	setExternalConnected(external);
  	setExternalChargeCapable(capable);
  	setIsCharging(charging);
-@@ -119,8 +178,8 @@
+@@ -119,8 +179,8 @@
  	putBool("FullyCharged", full);
  	putBool("AppleRawExternalConnected", external);
  	putNumber("AppleRawCurrentCapacity", capacity);
@@ -137,7 +142,7 @@ the PM6150 RTC seconds at start (needs 0902).
  	putNumber("InstantAmperage", (UInt32)ma);
  	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
  	putNumber("Temperature", 2500);
-@@ -137,7 +196,7 @@
+@@ -137,7 +197,7 @@
  		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
  		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
  		    kIOBatteryFlagsKey};
@@ -146,7 +151,7 @@ the PM6150 RTC seconds at start (needs 0902).
  		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
  		    (charging ? kIOBatteryCharge : 0))};
  		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
-@@ -246,11 +305,308 @@
+@@ -246,41 +306,456 @@
  	    charging, full, true, currentValid);
  }
  
@@ -455,7 +460,107 @@ the PM6150 RTC seconds at start (needs 0902).
  		self->poll();
  		sender->setTimeoutMS(30000);
  	}
-@@ -262,20 +618,33 @@
+ }
+ 
++/*
++ * surya, backlight step 1: an observer named like iPhone X's driver.
++ * CoreBrightness/backboardd find it by backlight-control = true; the ADT
++ * /backlight node comes from scripts/adt-backlight.py. It drives no hardware:
++ * every property set on it, every message and user-client request is logged,
++ * to learn what iOS sends before the WLED is touched. IODisplayParameters is
++ * a guess in the macOS IODisplay shape; what iOS reads is part of the question.
++ */
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	IOReturn message(UInt32 type, IOService *provider, void *argument) APPLE_KEXT_OVERRIDE;
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++private:
++	unsigned fLines;
++	void logObject(const char *what, OSObject *object);
++};
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++void
++AppleARMBacklight::logObject(const char *what, OSObject *object)
++{
++	if (fLines >= 600) {
++		return;
++	}
++	++fLines;
++	OSSerialize *s = OSSerialize::withCapacity(512);
++	if (s && object && object->serialize(s)) {
++		IOLog("SURYA BACKLIGHT: %s %.900s\n", what, s->text());
++	} else {
++		IOLog("SURYA BACKLIGHT: %s (not serializable)\n", what);
++	}
++	OSSafeReleaseNULL(s);
++}
++
++bool
++AppleARMBacklight::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	fLines = 0;
++	setProperty("backlight-control", kOSBooleanTrue);
++	OSDictionary *params = OSDictionary::withCapacity(1);
++	OSDictionary *brightness = OSDictionary::withCapacity(3);
++	OSNumber *mn = OSNumber::withNumber(0ULL, 32), *mx = OSNumber::withNumber(1024ULL, 32),
++	    *val = OSNumber::withNumber(512ULL, 32);
++	if (params && brightness && mn && mx && val) {
++		brightness->setObject("min", mn);
++		brightness->setObject("max", mx);
++		brightness->setObject("value", val);
++		params->setObject("brightness", brightness);
++		setProperty("IODisplayParameters", params);
++	}
++	OSSafeReleaseNULL(mn);
++	OSSafeReleaseNULL(mx);
++	OSSafeReleaseNULL(val);
++	OSSafeReleaseNULL(brightness);
++	OSSafeReleaseNULL(params);
++	registerService();
++	IOLog("SURYA BACKLIGHT: observer registered (backlight-control)\n");
++	return true;
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	logObject("setProperties", properties);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleARMBacklight::message(UInt32 type, IOService *provider, void *argument)
++{
++	if (fLines < 600) {
++		++fLines;
++		IOLog("SURYA BACKLIGHT: message %#x from %s arg %p\n", (unsigned)type,
++		    provider ? provider->getName() : "-", argument);
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleARMBacklight::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++    IOUserClient **handler)
++{
++	(void)owningTask;
++	(void)securityID;
++	(void)handler;
++	IOLog("SURYA BACKLIGHT: newUserClient type %u refused\n", (unsigned)type);
++	return kIOReturnUnsupported;
++}
++
+ bool
+ SweetBattery::start(IOService *provider)
+ {
  	if (!IOPMPowerSource::start(provider)) {
  		return false;
  	}
@@ -492,3 +597,17 @@ the PM6150 RTC seconds at start (needs 0902).
  			poll();
  			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
  		}
+ 	}
+ 	registerService();
++	/* surya with the local ADT /backlight node: start the backlight observer. */
++	DTEntry blNode;
++	if (fSurya && SecureDTLookupEntry(NULL, "/backlight", &blNode) == kSuccess) {
++		AppleARMBacklight *bl = OSTypeAlloc(AppleARMBacklight);
++		if (bl && bl->init() && bl->attach(this) && !bl->start(this)) {
++			bl->detach(this);
++		}
++		OSSafeReleaseNULL(bl);
++	}
+ 	return true;
+ }
+ 
