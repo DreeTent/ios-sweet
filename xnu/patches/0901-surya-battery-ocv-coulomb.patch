@@ -7,6 +7,8 @@ is integrated; publish and log every 30 s; SMB5 termination sets 100%; a
 failed read keeps the last values instead of the 100% fallback. Without the
 node SweetBattery is unchanged for sweet.
 
+Read-only charger diagnostics: APSD type, ICL setting/status, AICL, FCC.
+
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
 @@ -3,6 +3,15 @@
@@ -45,7 +47,7 @@ node SweetBattery is unchanged for sweet.
  
  class SweetBattery : public IOPMPowerSource {
  	OSDeclareDefaultStructors(SweetBattery);
-@@ -28,14 +47,31 @@
+@@ -28,14 +47,34 @@
  	IOTimerEventSource *fTimer;
  	bool fTimerAdded, fRunning, fReal;
  	int fLastMode;
@@ -59,6 +61,9 @@ node SweetBattery is unchanged for sweet.
 +	int64_t fChargeNah, fCapNah;
 +	uint64_t fLastAbs;
 +	int fLastMa;
++	uint8_t fChgLast[11];
++	bool fChgLogged;
++	void suryaChargerLog(void);
  	void putNumber(const char *key, UInt32 value);
  	void putBool(const char *key, bool value);
  	void publish(unsigned percent, unsigned mv, int ma, bool external,
@@ -77,7 +82,7 @@ node SweetBattery is unchanged for sweet.
  	static unsigned estimatePercent(unsigned mv);
  };
  OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
-@@ -72,6 +108,15 @@
+@@ -72,6 +111,17 @@
  		}
  	}
  	fLastMode = -1;
@@ -90,10 +95,12 @@ node SweetBattery is unchanged for sweet.
 +	fChargeNah = fCapNah = 0;
 +	fLastAbs = 0;
 +	fLastMa = 0;
++	bzero(fChgLast, sizeof(fChgLast));
++	fChgLogged = false;
  	return true;
  }
  
-@@ -101,11 +146,11 @@
+@@ -101,11 +151,11 @@
  SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
      bool capable, bool charging, bool full, bool measured, bool currentValid)
  {
@@ -108,7 +115,7 @@ node SweetBattery is unchanged for sweet.
  	setExternalConnected(external);
  	setExternalChargeCapable(capable);
  	setIsCharging(charging);
-@@ -119,8 +164,8 @@
+@@ -119,8 +169,8 @@
  	putBool("FullyCharged", full);
  	putBool("AppleRawExternalConnected", external);
  	putNumber("AppleRawCurrentCapacity", capacity);
@@ -119,7 +126,7 @@ node SweetBattery is unchanged for sweet.
  	putNumber("InstantAmperage", (UInt32)ma);
  	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
  	putNumber("Temperature", 2500);
-@@ -137,7 +182,7 @@
+@@ -137,7 +187,7 @@
  		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
  		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
  		    kIOBatteryFlagsKey};
@@ -128,7 +135,7 @@ node SweetBattery is unchanged for sweet.
  		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
  		    (charging ? kIOBatteryCharge : 0))};
  		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
-@@ -246,11 +291,211 @@
+@@ -246,11 +296,254 @@
  	    charging, full, true, currentValid);
  }
  
@@ -273,6 +280,48 @@ node SweetBattery is unchanged for sweet.
 +	}
 +}
 +
++/*
++ * Why the charger gives what it gives, read-only: APSD result (charger type),
++ * the USBIN ICL setting and the DCDC/AICL ICL status (qpnp-smb5.c pm8150b
++ * params, which PM6150 uses: 50 mA steps), ICL mode bits and the FCC setting.
++ * Logged when any byte changes.
++ */
++void
++SweetBattery::suryaChargerLog(void)
++{
++	static const uint16_t regs[] = {
++		0x1307, /* APSD_STATUS */
++		0x1308, /* APSD_RESULT_STATUS */
++		0x1366, /* USBIN_ICL_OPTIONS: USB51_MODE bit1, USBIN_MODE_CHG bit0 */
++		0x1370, /* USBIN_CURRENT_LIMIT_CFG */
++		0x1342, /* CMD_ICL_OVERRIDE */
++		0x1365, /* USBIN_LOAD_CFG: ICL_OVERRIDE_AFTER_APSD bit4 */
++		0x1106, /* ICL_MAX_STATUS */
++		0x1107, /* ICL_STATUS */
++		0x1108, /* AICL_ICL_STATUS */
++		0x110a, /* AICL_STATUS: AICL_DONE bit0 */
++		0x1061, /* CHGR_FAST_CHARGE_CURRENT_CFG */
++	};
++	uint8_t v[sizeof(regs) / sizeof(regs[0])];
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
++		if (sweet_spmi_read(0, regs[i], &v[i])) {
++			return;
++		}
++	}
++	if (fChgLogged && !memcmp(v, fChgLast, sizeof(v))) {
++		return;
++	}
++	memcpy(fChgLast, v, sizeof(v));
++	fChgLogged = true;
++	uint8_t r = v[1] & 0x7fu;
++	const char *type = (r & 0x40u) ? "QC3" : (r & 0x20u) ? "QC2" : (r & 0x10u) ? "FLOAT" :
++	    (r & 0x08u) ? "DCP" : (r & 0x04u) ? "CDP" : (r & 0x02u) ? "OCP" : (r & 0x01u) ? "SDP" : "none";
++	IOLog("SURYA CHARGER: apsd=%#x/%#x %s icl cfg=%umA max=%umA status=%umA aicl=%umA done=%u "
++	    "opts=%#x override=%#x load=%#x fcc=%umA\n",
++	    v[0], v[1], type, v[3] * 50u, v[6] * 50u, v[7] * 50u, v[8] * 50u, v[9] & 1u,
++	    v[2], v[4], v[5], v[10] * 50u);
++}
++
 +/* Every 30 s: charger state, publish, one log line. A failed read keeps the
 + * last published values instead of sweet's 100% fallback. */
 +void
@@ -322,6 +371,7 @@ node SweetBattery is unchanged for sweet.
 +	IOLog("SURYA BATTERY: soc=%u.%02u%% v=%umV i=%dmA ext=%d chg=%d state=%u full=%d start=%s %umV\n",
 +	    soc100 / 100u, soc100 % 100u, mv, fLastMa, external, charging, state, full,
 +	    fStartSource, fStartMv);
++	suryaChargerLog();
 +}
 +
  void
@@ -340,7 +390,7 @@ node SweetBattery is unchanged for sweet.
  		self->poll();
  		sender->setTimeoutMS(30000);
  	}
-@@ -262,20 +507,33 @@
+@@ -262,20 +555,33 @@
  	if (!IOPMPowerSource::start(provider)) {
  		return false;
  	}
