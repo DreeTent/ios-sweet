@@ -31,7 +31,7 @@ the root is mounted (the RTC itself is not writable from APPS).
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  /* Mach MIG declaration is not included by BSD's exported thread.h. */
-@@ -635,6 +644,1071 @@
+@@ -635,6 +644,1094 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -983,9 +983,15 @@ the root is mounted (the RTC itself is not writable from APPS).
 + *    Until then (clock_initialize_calendar runs before the root is mounted)
 + *    surya_time_get answers 0, as before. An RTC behind the saved value means
 + *    the RTC was reset; the offset is then dropped.
++ *  - boot-arg suryatime=<PC epoch>, patched into the image right before
++ *    fastboot boot (scripts/boot-with-time.sh): the Settings "Date & Time"
++ *    page hangs on this port (21.10), so the PC can set the time instead.
++ *    Time = suryatime + SURYA_TIME_LAG (fastboot transfer and start, about
++ *    7 s) + RTC seconds since the first clock read; then saved as above.
 + */
 +#define SURYA_TIME_FILE  "/private/var/db/surya-time"
 +#define SURYA_TIME_MAGIC 0x53525443u /* "SRTC" */
++#define SURYA_TIME_LAG   7u
 +
 +struct surya_time_rec {
 +	uint32_t magic, version;
@@ -995,6 +1001,7 @@ the root is mounted (the RTC itself is not writable from APPS).
 +
 +static int64_t surya_offset;
 +static bool surya_offset_valid, surya_time_done, surya_time_restoring;
++static uint32_t surya_rtc_first; /* RTC at the first clock read, for suryatime */
 +
 +long surya_time_get(void);
 +void surya_time_set(long secs);
@@ -1043,6 +1050,9 @@ the root is mounted (the RTC itself is not writable from APPS).
 +surya_time_get(void)
 +{
 +	uint32_t rtc = surya_rtc_now();
++	if (rtc != 0xffffffffu && !surya_rtc_first) {
++		surya_rtc_first = rtc;
++	}
 +	if (rtc == 0xffffffffu || !surya_offset_valid) {
 +		return 0;
 +	}
@@ -1077,6 +1087,19 @@ the root is mounted (the RTC itself is not writable from APPS).
 +		return 0;
 +	}
 +	surya_time_done = true;
++	unsigned long long pc = 0;
++	uint32_t now = surya_rtc_now();
++	if (PE_parse_boot_argn("suryatime", &pc, sizeof(pc)) && pc > 1600000000ULL &&
++	    now != 0xffffffffu && surya_rtc_first && now >= surya_rtc_first) {
++		long secs = (long)(pc + SURYA_TIME_LAG + (now - surya_rtc_first));
++		surya_time_set(secs); /* offset + file */
++		surya_time_restoring = true;
++		clock_set_calendar_microtime((clock_sec_t)secs, 0);
++		surya_time_restoring = false;
++		printf("SURYA TIME: from boot-arg %llu + %u + %u s -> %ld\n", pc, SURYA_TIME_LAG,
++		    now - surya_rtc_first, secs);
++		return 1;
++	}
 +	struct surya_time_rec rec;
 +	bzero(&rec, sizeof(rec));
 +	int err = surya_time_file(false, &rec);
@@ -1103,7 +1126,7 @@ the root is mounted (the RTC itself is not writable from APPS).
  void
  sweet_touch_init(void)
  {
-@@ -644,13 +1718,16 @@
+@@ -644,13 +1741,16 @@
  		return;
  	}
  	st.started = true;
