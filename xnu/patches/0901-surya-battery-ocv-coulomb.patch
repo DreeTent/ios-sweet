@@ -14,6 +14,9 @@ Backlight: an AppleARMBacklight service (backlight-control = true), started
 from SweetBattery when the local ADT has /backlight. iOS's "brightness"
 (0..1024) drives the PM6150L WLED5 through sweet_spmi_write (0902): 0 turns
 the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
+Time: the PM6150 RTC behind SweetPlatformExpert's clock hooks (0903): read
+RTC_READ 0x6048, write as qpnp_rtc_set_time, start it if stopped, publish
+IORTC when APPS owns the RTC write channel.
 
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
@@ -33,7 +36,7 @@ the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
-@@ -11,10 +20,28 @@
+@@ -11,10 +20,33 @@
  #include <IOKit/IOTimerEventSource.h>
  #include <IOKit/pwr_mgt/IOPMPowerSource.h>
  #include <libkern/c++/OSCollectionIterator.h>
@@ -47,6 +50,11 @@ the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
  extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
 +extern "C" int sweet_spmi_owner(unsigned sid, unsigned peripheral, unsigned *apid);
 +extern "C" int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
++/* iokit/Kernel/arm/SweetPlatformExpert.cpp */
++extern "C" long (*sweet_rtc_get_hook)(void);
++extern "C" void (*sweet_rtc_set_hook)(long secs);
++static uint32_t surya_rtc_read(void);
++static int surya_rtc_attach(void);
 +extern "C" uint64_t mach_absolute_time(void);
 +extern "C" void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 +
@@ -62,7 +70,7 @@ the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
  
  class SweetBattery : public IOPMPowerSource {
  	OSDeclareDefaultStructors(SweetBattery);
-@@ -28,14 +55,37 @@
+@@ -28,14 +60,37 @@
  	IOTimerEventSource *fTimer;
  	bool fTimerAdded, fRunning, fReal;
  	int fLastMode;
@@ -79,8 +87,8 @@ the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
 +	uint8_t fChgLast[11];
 +	bool fChgLogged;
 +	uint32_t fRtcSec;
++	int fRtcCtrl;  /* RTC control byte at attach, -1 untouched */
 +	void suryaChargerLog(void);
-+	static uint32_t suryaRtc(void);
  	void putNumber(const char *key, UInt32 value);
  	void putBool(const char *key, bool value);
  	void publish(unsigned percent, unsigned mv, int ma, bool external,
@@ -100,7 +108,7 @@ the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
  	static unsigned estimatePercent(unsigned mv);
  };
  OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
-@@ -72,6 +122,18 @@
+@@ -72,6 +127,19 @@
  		}
  	}
  	fLastMode = -1;
@@ -116,10 +124,11 @@ the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
 +	bzero(fChgLast, sizeof(fChgLast));
 +	fChgLogged = false;
 +	fRtcSec = 0;
++	fRtcCtrl = -1;
  	return true;
  }
  
-@@ -101,11 +163,11 @@
+@@ -101,11 +169,11 @@
  SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
      bool capable, bool charging, bool full, bool measured, bool currentValid)
  {
@@ -134,7 +143,7 @@ the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
  	setExternalConnected(external);
  	setExternalChargeCapable(capable);
  	setIsCharging(charging);
-@@ -119,8 +181,8 @@
+@@ -119,8 +187,8 @@
  	putBool("FullyCharged", full);
  	putBool("AppleRawExternalConnected", external);
  	putNumber("AppleRawCurrentCapacity", capacity);
@@ -145,7 +154,7 @@ the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
  	putNumber("InstantAmperage", (UInt32)ma);
  	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
  	putNumber("Temperature", 2500);
-@@ -137,7 +199,7 @@
+@@ -137,7 +205,7 @@
  		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
  		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
  		    kIOBatteryFlagsKey};
@@ -154,7 +163,7 @@ the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
  		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
  		    (charging ? kIOBatteryCharge : 0))};
  		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
-@@ -246,41 +308,548 @@
+@@ -246,41 +314,616 @@
  	    charging, full, true, currentValid);
  }
  
@@ -283,7 +292,7 @@ the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
 +		return;
 +	}
 +	fStartMv = uv / 1000u;
-+	fRtcSec = suryaRtc();
++	fRtcSec = surya_rtc_read();
 +	fChargeNah = fCapNah * suryaSoc100(uv) / 10000;
 +	fLastAbs = mach_absolute_time();
 +	fSuryaValid = true;
@@ -320,22 +329,25 @@ the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
 +}
 +
 +/*
-+ * PM6150 RTC seconds (RTC_RW 0x6040..0x6043, as rtc-pm8xxx: read the four
-+ * bytes, re-read byte 0 and retry on rollover). Surya's DT forbids Linux
-+ * from writing it (qpnp-rtc-write = 0), so whether it is epoch time is what
-+ * this log is for; XNU itself gets 0 from the generic platform expert.
++ * PM6150 RTC (qpnp-rtc.c, RTC_RW at 0x6000 on SID 0). Seconds are read from
++ * RTC_READ 0x6048..0x604b: read the four bytes, re-read byte 0 and retry if
++ * it rolled over. 0x6040..0x6043 are the write data, not the count (reading
++ * them gave the bogus rtc0=0 of 20.10). Surya's DT keeps Linux from writing
++ * the RTC (qpnp-rtc-write = 0); that is a policy, and iOS here owns the time.
 + */
-+uint32_t
-+SweetBattery::suryaRtc(void)
++static IOLock *gSuryaRtcLock;
++
++static uint32_t
++surya_rtc_read(void)
 +{
 +	for (unsigned attempt = 0; attempt < 3; ++attempt) {
 +		uint8_t b[4], again;
 +		bool ok = true;
 +		for (unsigned i = 0; i < 4 && ok; ++i) {
-+			ok = !sweet_spmi_read(0, 0x6040u + i, &b[i]);
++			ok = !sweet_spmi_read(0, 0x6048u + i, &b[i]);
 +		}
-+		if (!ok || sweet_spmi_read(0, 0x6040u, &again)) {
-+			return 0xffffffffu; /* read failed, as opposed to a zero counter */
++		if (!ok || sweet_spmi_read(0, 0x6048u, &again)) {
++			return 0xffffffffu; /* read failed */
 +		}
 +		if (again >= b[0]) {
 +			return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
@@ -343,6 +355,69 @@ the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
 +		}
 +	}
 +	return 0xffffffffu;
++}
++
++/* SweetPlatformExpert::getGMTTimeOfDay -> here: the RTC seconds, 0 on failure. */
++static long
++surya_rtc_get(void)
++{
++	uint32_t secs = surya_rtc_read();
++	return secs == 0xffffffffu ? 0 : (long)secs;
++}
++
++/*
++ * SweetPlatformExpert::setGMTTimeOfDay -> here, when iOS sets the time
++ * (settimeofday -> clock_set_calendar_microtime -> PESetUTCTimeOfDay).
++ * qpnp_rtc_set_time's order: RTC off, WDATA0 = 0, WDATA1..3, WDATA0, RTC on.
++ */
++static void
++surya_rtc_set(long secs)
++{
++	if (secs < 0 || secs > 0xffffffffL || !gSuryaRtcLock) {
++		return;
++	}
++	uint32_t v = (uint32_t)secs;
++	uint8_t ctrl = 0;
++	IOLockLock(gSuryaRtcLock);
++	int err = sweet_spmi_read(0, 0x6046, &ctrl);
++	if (!err) {
++		err |= sweet_spmi_write(0, 0x6046, (uint8_t)(ctrl & ~0x80u));
++		err |= sweet_spmi_write(0, 0x6040, 0);
++		err |= sweet_spmi_write(0, 0x6041, (uint8_t)(v >> 8));
++		err |= sweet_spmi_write(0, 0x6042, (uint8_t)(v >> 16));
++		err |= sweet_spmi_write(0, 0x6043, (uint8_t)(v >> 24));
++		err |= sweet_spmi_write(0, 0x6040, (uint8_t)v);
++		err |= sweet_spmi_write(0, 0x6046, (uint8_t)(ctrl | 0x80u));
++	}
++	IOLockUnlock(gSuryaRtcLock);
++	IOLog("SURYA RTC: set %u%s\n", v, err ? " FAILED" : "");
++}
++
++/*
++ * At SweetBattery start on surya: if APPS owns the RTC write channel, make
++ * sure the RTC counts, route the platform clock to it and publish IORTC, which
++ * IOKitInitializeTime waits up to 30 s for before clock_initialize_calendar.
++ * Returns the RTC control byte, or -1 when the RTC is left alone.
++ */
++static int
++surya_rtc_attach(void)
++{
++	unsigned apid = 0;
++	uint8_t ctrl = 0;
++	if (sweet_spmi_owner(0, 0x60, &apid) != 0 || sweet_spmi_read(0, 0x6046, &ctrl)) {
++		return -1;
++	}
++	gSuryaRtcLock = IOLockAlloc();
++	if (!gSuryaRtcLock) {
++		return -1;
++	}
++	if (!(ctrl & 0x80u)) {
++		(void)sweet_spmi_write(0, 0x6046, (uint8_t)(ctrl | 0x80u)); /* start counting */
++	}
++	sweet_rtc_get_hook = surya_rtc_get;
++	sweet_rtc_set_hook = surya_rtc_set;
++	IOService::publishResource("IORTC");
++	return ctrl;
 +}
 +
 +/*
@@ -441,9 +516,10 @@ the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
 +	publish(percent, mv, fLastMa, external, capable, charging, full, true, true);
 +	fPublished = true;
 +	IOLog("SURYA BATTERY: soc=%u.%02u%% v=%umV i=%dmA ocv=%umV vsoc=%u.%02u%% ext=%d chg=%d state=%u "
-+	    "full=%d start=%s %umV s7=%umV rtc0=%#x\n",
++	    "full=%d start=%s %umV s7=%umV rtc0=%u rtcctl=%d now=%u\n",
 +	    soc100 / 100u, soc100 % 100u, mv, fLastMa, ocv / 1000u, vsoc100 / 100u, vsoc100 % 100u,
-+	    external, charging, state, full, fStartSource, fStartMv, fS7Mv, fRtcSec);
++	    external, charging, state, full, fStartSource, fStartMv, fS7Mv, fRtcSec, fRtcCtrl,
++	    surya_rtc_read());
 +	suryaChargerLog();
 +}
 +
@@ -670,6 +746,7 @@ the module off, N sets level N*4095/1024 (min 42) as qcom-spmi-wled.c does.
  	/* Publish a complete source BEFORE registerService wakes powerd. */
 -	poll();
 +	if (fSurya) {
++		fRtcCtrl = surya_rtc_attach();
 +		suryaStart();
 +		suryaPoll();
 +	} else {
