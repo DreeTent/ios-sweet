@@ -1,0 +1,24 @@
+sweet: hand every keys poll to surya (torch long press)
+
+sweet_keys' 20 ms poll passes the debounced key states to surya_keys_poll()
+(bsd/dev/sweet_touch.c, 0900): a long volume-down press switches the torch.
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -15,6 +15,9 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
++/* surya (bsd/dev/sweet_touch.c): every poll's key states, for the torch's long
++ * volume-down press. */
++extern void surya_keys_poll(const int now[3]);
+ void sweet_keys_init(void);
+ 
+ #define KEYS_CORE_PA     0x0c440000u
+@@ -118,6 +121,7 @@
+ 				sweet_hid_key(k, state[k]);
+ 			}
+ 		}
++		surya_keys_poll(state);
+ 		keys_wait();
+ 	}
+ }

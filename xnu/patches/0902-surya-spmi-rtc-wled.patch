@@ -7,18 +7,24 @@ registers 0xd846, 0xd953, 0xd954, 0xd965, only through the APPS-owned
 write channel (spmi-pmic-arb.c v5), for the backlight. Everything else stays
 read-only.
 
+Also on SID 5 (21.10): the flash LED block 0xd3 (torch: timers 0xd340/41,
+current 0xd343/44, module 0xd346, step 0xd347, strobe 0xd349/4a, channel
+enable 0xd34c, torch clamp 0xd3ec), LPG channel 0 0xb141..0xb147 and TRILED
+enable 0xd046 (notification LED); readable: blocks 0xd3, 0xb1, 0xd0. Writes
+still only from this list and only through the APPS-owned channel.
 --- a/bsd/dev/sweet_spmi.c
 +++ b/bsd/dev/sweet_spmi.c
-@@ -4,6 +4,8 @@
+@@ -4,6 +4,9 @@
   * No interrupt clear, peripheral enable, charger config, or PMIC writes.
   * Init is serialized by the single built-in SweetBattery personality.
   * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
-+ * surya adds one exception, sweet_spmi_write(): four PM6150L WLED5 backlight
-+ * registers on SID 5, through the APPS-owned write channel only.
++ * surya adds one exception, sweet_spmi_write(): a fixed list of PM6150L
++ * registers on SID 5 (WLED5 backlight, flash LED torch, LPG channel 0 and
++ * TRILED for the notification LED), through the APPS-owned write channel only.
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <sys/param.h>
-@@ -83,14 +85,94 @@
+@@ -83,14 +86,108 @@
  	return 0;
  }
  
@@ -33,12 +39,24 @@ read-only.
 +
 +int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
 +
++/* SID 5 registers surya may write; nothing else is ever written. */
++static const uint16_t sp_writable[] = {
++	0xd846, 0xd953, 0xd954, 0xd965,                 /* WLED5: module enable, brightness, sync */
++	0xd340, 0xd341, 0xd343, 0xd344, 0xd346, 0xd347, /* flash LED: timers, current, module, step */
++	0xd349, 0xd34a, 0xd34c, 0xd3ec,                 /* strobe, channel enable, torch clamp */
++	0xb141, 0xb142, 0xb143, 0xb144, 0xb145, 0xb146, 0xb147, /* LPG channel 0 PWM */
++	0xd046,                                         /* TRILED enable */
++};
++
 +int
 +sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value)
 +{
 +	static vm_offset_t chan[512];
-+	if (!sp_ready || sid != 5 ||
-+	    (addr != 0xd846 && addr != 0xd953 && addr != 0xd954 && addr != 0xd965)) {
++	bool listed = false;
++	for (unsigned i = 0; i < sizeof(sp_writable) / sizeof(sp_writable[0]); ++i) {
++		listed = listed || addr == sp_writable[i];
++	}
++	if (!sp_ready || sid != 5 || !listed) {
 +		return -1;
 +	}
 +	IOLockLock(sp_lock);
@@ -110,8 +128,10 @@ read-only.
 +	    (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
 +	    peripheral == 0x13 || peripheral == 0x48 ||
 +	    peripheral == 0x60); /* 0x60: PM6150 RTC_RW, read by surya's battery log */
-+	/* surya: PM6150L WLED5 control and sink on SID 5, for the backlight. */
-+	bool sid5 = sid == 5 && (peripheral == 0xd8 || peripheral == 0xd9);
++	/* surya: PM6150L on SID 5: WLED5 control and sink (backlight), flash LED
++	 * (torch), LPG channel 0 and TRILED (notification LED). */
++	bool sid5 = sid == 5 && (peripheral == 0xd8 || peripheral == 0xd9 || peripheral == 0xd3 ||
++	    peripheral == 0xb1 || peripheral == 0xd0);
 +	if (!sp_ready || !out || addr > 0xffffu || (!sid0 && !sid5)) {
  		return -1;
  	}

@@ -13,9 +13,20 @@ And surya's wall clock: PM6150 RTC + an offset kept in
 /private/var/db/surya-time, written when iOS sets the time and applied once
 the root is mounted (the RTC itself is not writable from APPS).
 
+Display state and the small things that follow it (21.10): SweetFramebuffer
+calls surya_display_power() (0911). With the display off, a double tap
+(two short one-finger taps, 400 ms apart, within 150 px) presses the power
+key for iOS (suryadoubletap=0 turns it off). The torch: both PM6150L flash
+LEDs at 150 mA in torch mode (Linux leds-qcom-flash.c sequence), switched by
+a long volume-down press with the display off (sweet_keys poll, 0910). The
+white notification LED on PM6150L LPG channel 0 + TRILED (leds-qcom-lpg.c
+PWM mode), driven from SweetBattery's timer: steady while charging, blinking
+below 15 % on battery, display off only (suryaledtest=1 blinks it at start).
+Torch and LED go dark before power off and restart. surya_db_rw() reads and
+writes the small state files in /private/var/db (time, backlight).
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -14,6 +14,15 @@
+@@ -14,12 +14,25 @@
  #include <kern/sched_prim.h>
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
@@ -31,7 +42,17 @@ the root is mounted (the RTC itself is not writable from APPS).
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  /* Mach MIG declaration is not included by BSD's exported thread.h. */
-@@ -635,6 +644,1094 @@
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_key(int key, int down);
++/* sweet_spmi.c; kept out of sweet's sweet_spmi.h */
++extern int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
++extern int sweet_spmi_owner(unsigned sid, unsigned peripheral, unsigned *apid);
+ void sweet_touch_init(void);
+ 
+ #define TOUCH_SE_PA      0x00a84000u
+@@ -635,6 +648,1427 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -718,6 +739,8 @@ the root is mounted (the RTC itself is not writable from APPS).
 +	touch_report(0, st.x, st.y);
 +}
 +
++static void surya_tap_track(uint32_t now, const int *x, const int *y);
++
 +/* One event-buffer read: nvt_ts_work_func parsing; logs instead of input reports. */
 +static void
 +surya_touch_frame(void)
@@ -796,6 +819,7 @@ the root is mounted (the RTC itself is not writable from APPS).
 +		}
 +	}
 +	sf.down = now;
++	surya_tap_track(now, x, y);
 +	/* Milestone 4: same panel pixels as the sweet ICs, same path into SweetHID. */
 +	touch_report(now, x, y);
 +}
@@ -925,10 +949,16 @@ the root is mounted (the RTC itself is not writable from APPS).
 +	return (int32_t)x0;
 +}
 +
++static void surya_lights_off(void);
++
 +static int
 +surya_halt_restart(unsigned int type)
 +{
 +	uint64_t fn;
++	if (type == kPEHaltCPU || type == kPEUPSDelayHaltCPU || type == kPERestartCPU ||
++	    type == kPEPanicRestartCPU) {
++		surya_lights_off(); /* PMIC blocks keep their state over a warm reset */
++	}
 +	switch (type) {
 +	case kPEHaltCPU:
 +	case kPEUPSDelayHaltCPU:
@@ -1028,22 +1058,41 @@ the root is mounted (the RTC itself is not writable from APPS).
 +	return 0xffffffffu;
 +}
 +
-+static int
-+surya_time_file(bool write, struct surya_time_rec *rec)
++/* Small kernel-owned state files under /private/var/db (time, backlight). */
++int surya_db_rw(const char *path, int write, void *buf, int len);
++int surya_root_ready(void);
++
++int
++surya_root_ready(void)
++{
++	return rootvnode != NULLVP;
++}
++
++int
++surya_db_rw(const char *path, int write, void *buf, int len)
 +{
 +	vfs_context_t ctx = vfs_context_kernel();
 +	vnode_t vp = NULLVP;
 +	int fmode = write ? (O_CREAT | O_TRUNC | FWRITE) : FREAD;
 +	int resid = 0;
-+	int err = vnode_open(SURYA_TIME_FILE, fmode, 0600, 0, &vp, ctx);
++	if (!rootvnode) {
++		return ENOENT;
++	}
++	int err = vnode_open(path, fmode, 0600, 0, &vp, ctx);
 +	if (err) {
 +		return err;
 +	}
-+	err = vn_rdwr(write ? UIO_WRITE : UIO_READ, vp, (caddr_t)rec, (int)sizeof(*rec), 0,
++	err = vn_rdwr(write ? UIO_WRITE : UIO_READ, vp, (caddr_t)buf, len, 0,
 +	    UIO_SYSSPACE, IO_NOAUTH | (write ? IO_SYNC : 0), vfs_context_ucred(ctx), &resid,
 +	    vfs_context_proc(ctx));
 +	(void)vnode_close(vp, write ? FWRITE : FREAD, ctx);
 +	return err ? err : (resid ? EIO : 0);
++}
++
++static int
++surya_time_file(bool write, struct surya_time_rec *rec)
++{
++	return surya_db_rw(SURYA_TIME_FILE, write, rec, (int)sizeof(*rec));
 +}
 +
 +long
@@ -1123,10 +1172,315 @@ the root is mounted (the RTC itself is not writable from APPS).
 +	return 1;
 +}
 +
++/*
++ * surya: what follows the display state. SweetFramebuffer calls
++ * surya_display_power() on iOS RequestPowerChange (display off on lock or
++ * auto-lock, on again). Users: double tap to wake, the torch on a long
++ * volume-down press, the notification LED. Like the power and clock code
++ * above, this lives here because this file is surya's C home.
++ */
++static volatile int surya_disp_on = 1;
++
++void surya_display_power(int on);
++int surya_display_is_on(void);
++
++void
++surya_display_power(int on)
++{
++	surya_disp_on = on;
++}
++
++int
++surya_display_is_on(void)
++{
++	return surya_disp_on;
++}
++
++/*
++ * Double tap to wake: with the display off, two short taps of one finger,
++ * the second starting at most 400 ms after the first ended and within 150 px
++ * of it, press the power key for iOS (the key path of the hardware button).
++ * Found in the ordinary touch reports: the controller keeps scanning while the
++ * display is off. Novatek's own gesture mode (0x13 to EVENT_MAP_HOST_CMD, as
++ * nvt_ts_suspend) needs a firmware download after every display on; it is
++ * left for the battery work. Boot-arg suryadoubletap=0 turns this off.
++ */
++#define SURYA_TAP_MAX_NS 300000000ULL /* one tap, finger down to up */
++#define SURYA_TAP_GAP_NS 400000000ULL /* first tap up to second tap down */
++#define SURYA_TAP_MOVE   60           /* px a tap may wander */
++#define SURYA_TAP_DIST   150          /* px between the two taps */
++
++static struct {
++	int enabled;    /* -1: boot-arg not read yet */
++	bool down, moved, first;
++	uint64_t t_down, t_up;
++	int x0, y0, fx, fy;
++} stap = { .enabled = -1 };
++
++static uint64_t
++surya_now_ns(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++
++static int
++surya_iabs(int v)
++{
++	return v < 0 ? -v : v;
++}
++
++static void
++surya_tap_track(uint32_t now, const int *x, const int *y)
++{
++	if (stap.enabled < 0) {
++		stap.enabled = 1;
++		(void)PE_parse_boot_argn("suryadoubletap", &stap.enabled, sizeof(stap.enabled));
++	}
++	if (!stap.enabled || surya_disp_on) {
++		stap.down = false;
++		stap.first = false;
++		return;
++	}
++	uint64_t t = surya_now_ns();
++	if (now) {
++		unsigned i = (unsigned)__builtin_ctz(now);
++		if (!stap.down) {
++			stap.down = true;
++			stap.moved = __builtin_popcount(now) > 1;
++			stap.t_down = t;
++			stap.x0 = x[i];
++			stap.y0 = y[i];
++			if (stap.first && t - stap.t_up > SURYA_TAP_GAP_NS) {
++				stap.first = false;
++			}
++		} else if (__builtin_popcount(now) > 1 || surya_iabs(x[i] - stap.x0) > SURYA_TAP_MOVE ||
++		    surya_iabs(y[i] - stap.y0) > SURYA_TAP_MOVE) {
++			stap.moved = true;
++		}
++		return;
++	}
++	if (!stap.down) {
++		return;
++	}
++	stap.down = false;
++	if (stap.moved || t - stap.t_down > SURYA_TAP_MAX_NS) {
++		stap.first = false;
++		return;
++	}
++	if (stap.first && surya_iabs(stap.x0 - stap.fx) <= SURYA_TAP_DIST &&
++	    surya_iabs(stap.y0 - stap.fy) <= SURYA_TAP_DIST) {
++		stap.first = false;
++		printf("SURYA TAP: double tap at %d,%d -> power key\n", stap.x0, stap.y0);
++		sweet_hid_key(0, 1);
++		sweet_hid_key(0, 0);
++		return;
++	}
++	stap.first = true;
++	stap.fx = stap.x0;
++	stap.fy = stap.y0;
++	stap.t_up = t;
++}
++
++/*
++ * Torch: both PM6150L flash LEDs (SID 5, block 0xd300) in torch mode, 150 mA
++ * each (sm7150-mainline's per-LED limit; Xiaomi's torch nodes say 300 mA, the
++ * module allows 500), with the sequence of Linux leds-qcom-flash.c
++ * (qcom_flash_led_brightness_set, torch): software strobe, current in 5 mA
++ * steps, safety timer off, module on, channels on. The module is checked
++ * first (type 0x18, a known subtype, write channel owned by APPS) and the
++ * torch clamp set once. A long volume-down press (800 ms) switches it while
++ * the display is off, or off whenever it is on (the user's choice, 21.10).
++ */
++#define SURYA_TORCH_CODE 0x1d   /* 150 mA = (29 + 1) * 5 mA */
++
++static int surya_torch_ok = -1; /* -1 unchecked, 0 unusable, 1 usable */
++static int surya_torch_on;
++
++static int
++surya_torch_check(void)
++{
++	if (surya_torch_ok >= 0) {
++		return surya_torch_ok;
++	}
++	uint8_t type = 0xee, subtype = 0xee;
++	unsigned apid = 0;
++	int owner = sweet_spmi_owner(5, 0xd3, &apid);
++	int err = sweet_spmi_read(5, 0xd304, &type);
++	err |= sweet_spmi_read(5, 0xd305, &subtype);
++	surya_torch_ok = !err && owner == 0 && type == 0x18 &&
++	    (subtype == 0x03 || subtype == 0x04 || subtype == 0x07);
++	int clamp = surya_torch_ok ? sweet_spmi_write(5, 0xd3ec, 0x63) : -1; /* 500 mA */
++	printf("SURYA TORCH: flash block type %#x subtype %#x apid %u owner %d, clamp %s -> %s\n",
++	    type, subtype, apid, owner, clamp ? "not set" : "500 mA",
++	    surya_torch_ok ? "usable" : "NOT usable");
++	return surya_torch_ok;
++}
++
++static int
++surya_torch_set(int on)
++{
++	if (!surya_torch_check()) {
++		return -1;
++	}
++	int err = 0;
++	if (on) {
++		err |= sweet_spmi_write(5, 0xd349, 0x01); /* CHAN_STROBE: software, level, high */
++		err |= sweet_spmi_write(5, 0xd34a, 0x01);
++		err |= sweet_spmi_write(5, 0xd34c, 0x00); /* CHAN_EN off while configuring */
++		err |= sweet_spmi_write(5, 0xd346, 0x00); /* MODULE_EN off */
++		err |= sweet_spmi_write(5, 0xd343, SURYA_TORCH_CODE); /* ITARGET */
++		err |= sweet_spmi_write(5, 0xd344, SURYA_TORCH_CODE);
++		err |= sweet_spmi_write(5, 0xd347, 0x0f); /* IRESOLUTION: 5 mA, channels 0 and 1 */
++		err |= sweet_spmi_write(5, 0xd340, 0x00); /* CHAN_TIMER off */
++		err |= sweet_spmi_write(5, 0xd341, 0x00);
++		err |= sweet_spmi_write(5, 0xd346, 0x80); /* MODULE_EN */
++		err |= sweet_spmi_write(5, 0xd34c, 0x03); /* CHAN_EN: channels 0 and 1 */
++	} else {
++		err |= sweet_spmi_write(5, 0xd34c, 0x00);
++		err |= sweet_spmi_write(5, 0xd346, 0x00);
++	}
++	uint8_t st[3] = {0xee, 0xee, 0xee};
++	for (unsigned i = 0; i < 3; ++i) {
++		(void)sweet_spmi_read(5, 0xd308 + i, &st[i]);
++	}
++	surya_torch_on = on && !err;
++	printf("SURYA TORCH: %s%s, status %02x %02x %02x\n", on ? "on" : "off",
++	    err ? " FAILED" : "", st[0], st[1], st[2]);
++	return err ? -1 : 0;
++}
++
++/* Called by sweet_keys' 20 ms poll with the current key states (0 power,
++ * 1 volume up, 2 volume down). */
++void surya_keys_poll(const int now[3]);
++
++void
++surya_keys_poll(const int now[3])
++{
++	static unsigned held;
++	static bool fired;
++	if (!now[2]) {
++		held = 0;
++		fired = false;
++		return;
++	}
++	if (++held >= 40 && !fired) {
++		fired = true;
++		if (!surya_disp_on || surya_torch_on) {
++			(void)surya_torch_set(!surya_torch_on);
++		}
++	}
++}
++
++/*
++ * Notification LED: white, PM6150L LPG channel 0 (SID 5, 0xb100) through the
++ * TRILED block (0xd000, bit 7), as Linux leds-qcom-lpg.c (pm8150l_lpg_data)
++ * in PWM mode (lpg_apply): 9-bit PWM from 19.2 MHz / 5 / 2^3, a 1.07 ms
++ * period, duty = value / 512, glitch removal off while it changes, the value
++ * written again after the output is enabled (LPG erratum), then sync. Until
++ * iOS notifications reach it (an own service, later) the battery timer drives
++ * it: steady while charging with the display off, blinking below 15 % on
++ * battery with the display off.
++ */
++#define SURYA_LED_DUTY 128      /* of 512 */
++
++static int surya_led_ok = -1;
++static unsigned surya_led_duty;
++
++static int
++surya_led_check(void)
++{
++	if (surya_led_ok >= 0) {
++		return surya_led_ok;
++	}
++	uint8_t type = 0xee, subtype = 0xee, en = 0xee;
++	unsigned lapid = 0, tapid = 0;
++	int lown = sweet_spmi_owner(5, 0xb1, &lapid), town = sweet_spmi_owner(5, 0xd0, &tapid);
++	int err = sweet_spmi_read(5, 0xb104, &type);
++	err |= sweet_spmi_read(5, 0xb105, &subtype);
++	err |= sweet_spmi_read(5, 0xd046, &en);
++	surya_led_ok = !err && lown == 0 && town == 0 && subtype == 0x02; /* LPG_SUBTYPE_LPG */
++	printf("SURYA LED: lpg type %#x subtype %#x apid %u owner %d, triled en %#x apid %u owner %d -> %s\n",
++	    type, subtype, lapid, lown, en, tapid, town, surya_led_ok ? "usable" : "NOT usable");
++	return surya_led_ok;
++}
++
++static int
++surya_led_set(unsigned duty)
++{
++	if (duty == surya_led_duty || !surya_led_check()) {
++		return 0;
++	}
++	int err = 0;
++	if (duty) {
++		uint8_t tc = 0;
++		err |= sweet_spmi_read(5, 0xb143, &tc);
++		err |= sweet_spmi_write(5, 0xb143, (uint8_t)(tc | 0x20u));  /* glitch removal off */
++		err |= sweet_spmi_write(5, 0xb141, 0x33);                   /* 19.2 MHz, LPG size */
++		err |= sweet_spmi_write(5, 0xb142, 0x43);                   /* pre-divide 5, 2^3 */
++		err |= sweet_spmi_write(5, 0xb144, (uint8_t)(duty & 0xffu));
++		err |= sweet_spmi_write(5, 0xb145, (uint8_t)(duty >> 8));
++		err |= sweet_spmi_write(5, 0xb146, 0xa4);                   /* output, tristate, PWM */
++		err |= sweet_spmi_write(5, 0xb144, (uint8_t)(duty & 0xffu));
++		err |= sweet_spmi_write(5, 0xb145, (uint8_t)(duty >> 8));
++		err |= sweet_spmi_write(5, 0xb147, 0x01);                   /* sync */
++		err |= sweet_spmi_write(5, 0xb143, (uint8_t)(tc & ~0x20u)); /* glitch removal on */
++		err |= sweet_spmi_write(5, 0xd046, 0x80);                   /* TRILED channel 0 */
++	} else {
++		err |= sweet_spmi_write(5, 0xd046, 0x00);
++		err |= sweet_spmi_write(5, 0xb146, 0x24);
++	}
++	if (err) {
++		printf("SURYA LED: duty %u FAILED\n", duty);
++		surya_led_ok = 0;
++		return -1;
++	}
++	surya_led_duty = duty;
++	return 0;
++}
++
++/* Every second from SweetBattery's timer, with the last published state. */
++void surya_led_tick(int external, int charging, unsigned percent);
++
++void
++surya_led_tick(int external, int charging, unsigned percent)
++{
++	static unsigned tick;
++	static int test = -1;
++	++tick;
++	if (test < 0) {
++		test = 0;
++		(void)PE_parse_boot_argn("suryaledtest", &test, sizeof(test));
++	}
++	unsigned want = 0;
++	if (test && tick <= 20) {
++		want = (tick & 1u) ? SURYA_LED_DUTY : 0; /* suryaledtest=1: 10 blinks at start */
++	} else if (!surya_disp_on) {
++		if (charging) {
++			want = SURYA_LED_DUTY;
++		} else if (!external && percent && percent < 15) {
++			want = (tick & 1u) ? SURYA_LED_DUTY : 0;
++		}
++	}
++	(void)surya_led_set(want);
++}
++
++static void
++surya_lights_off(void)
++{
++	if (surya_torch_on) {
++		(void)surya_torch_set(0);
++	}
++	if (surya_led_duty) {
++		(void)surya_led_set(0);
++	}
++}
++
  void
  sweet_touch_init(void)
  {
-@@ -644,13 +1741,16 @@
+@@ -644,13 +2078,16 @@
  		return;
  	}
  	st.started = true;

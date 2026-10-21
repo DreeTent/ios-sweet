@@ -1,0 +1,23 @@
+sweet: tell surya when iOS turns the display off and on
+
+RequestPowerChange calls surya_display_power() (bsd/dev/sweet_touch.c, 0900):
+double tap to wake, the torch's long press and the notification LED depend on it.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,8 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++/* surya (bsd/dev/sweet_touch.c): display on/off for double tap, torch, LED. */
++extern "C" void surya_display_power(int on);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -542,6 +544,7 @@
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
++			surya_display_power(off ? 0 : 1);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;

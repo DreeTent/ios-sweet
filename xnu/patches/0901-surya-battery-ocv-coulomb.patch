@@ -18,6 +18,11 @@ Time: SweetPlatformExpert's clock hooks (0903) go to surya_time_* in
 sweet_touch.c (0900) and IORTC is published; the 1 s timer calls
 surya_time_tick until the saved time is applied.
 
+Brightness across reboots: the last non-zero brightness iOS set is saved in
+/private/var/db/surya-backlight 2 s after it changes; once the root is mounted
+it is applied (unless iOS set one first) and published as the IODisplayParameters
+"value" iOS fades from, instead of a fixed 512. The 1 s timer also drives the
+notification LED (0900) with the last published charger state.
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
 @@ -3,6 +3,15 @@
@@ -36,7 +41,7 @@ surya_time_tick until the saved time is applied.
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
-@@ -11,10 +20,37 @@
+@@ -11,10 +20,42 @@
  #include <IOKit/IOTimerEventSource.h>
  #include <IOKit/pwr_mgt/IOPMPowerSource.h>
  #include <libkern/c++/OSCollectionIterator.h>
@@ -57,6 +62,11 @@ surya_time_tick until the saved time is applied.
 +extern "C" long surya_time_get(void);
 +extern "C" void surya_time_set(long secs);
 +extern "C" int surya_time_tick(void);
++/* bsd/dev/sweet_touch.c (surya's C home): state files, notification LED. */
++extern "C" int surya_db_rw(const char *path, int write, void *buf, int len);
++extern "C" int surya_root_ready(void);
++extern "C" void surya_led_tick(int external, int charging, unsigned percent);
++static void surya_backlight_tick(OSObject *backlight); /* after AppleARMBacklight */
 +static uint32_t surya_rtc_read(void);
 +static int surya_rtc_attach(void);
 +extern "C" uint64_t mach_absolute_time(void);
@@ -74,7 +84,7 @@ surya_time_tick until the saved time is applied.
  
  class SweetBattery : public IOPMPowerSource {
  	OSDeclareDefaultStructors(SweetBattery);
-@@ -28,14 +64,38 @@
+@@ -28,14 +69,42 @@
  	IOTimerEventSource *fTimer;
  	bool fTimerAdded, fRunning, fReal;
  	int fLastMode;
@@ -93,6 +103,10 @@ surya_time_tick until the saved time is applied.
 +	uint32_t fRtcSec;
 +	int fRtcCtrl;  /* 0 once the clock hooks are attached, -1 before */
 +	bool fTimeDone;
++	/* surya: last published charger state for the notification LED. */
++	bool fLedExt, fLedChg;
++	unsigned fLedPct;
++	OSObject *fBacklight; /* AppleARMBacklight, for its 1 s tick */
 +	void suryaChargerLog(void);
  	void putNumber(const char *key, UInt32 value);
  	void putBool(const char *key, bool value);
@@ -113,7 +127,7 @@ surya_time_tick until the saved time is applied.
  	static unsigned estimatePercent(unsigned mv);
  };
  OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
-@@ -72,6 +132,20 @@
+@@ -72,6 +141,20 @@
  		}
  	}
  	fLastMode = -1;
@@ -134,7 +148,7 @@ surya_time_tick until the saved time is applied.
  	return true;
  }
  
-@@ -101,11 +175,11 @@
+@@ -101,11 +184,11 @@
  SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
      bool capable, bool charging, bool full, bool measured, bool currentValid)
  {
@@ -149,7 +163,7 @@ surya_time_tick until the saved time is applied.
  	setExternalConnected(external);
  	setExternalChargeCapable(capable);
  	setIsCharging(charging);
-@@ -119,8 +193,8 @@
+@@ -119,8 +202,8 @@
  	putBool("FullyCharged", full);
  	putBool("AppleRawExternalConnected", external);
  	putNumber("AppleRawCurrentCapacity", capacity);
@@ -160,7 +174,7 @@ surya_time_tick until the saved time is applied.
  	putNumber("InstantAmperage", (UInt32)ma);
  	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
  	putNumber("Temperature", 2500);
-@@ -137,7 +211,7 @@
+@@ -137,7 +220,7 @@
  		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
  		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
  		    kIOBatteryFlagsKey};
@@ -169,7 +183,7 @@ surya_time_tick until the saved time is applied.
  		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
  		    (charging ? kIOBatteryCharge : 0))};
  		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
-@@ -246,41 +320,567 @@
+@@ -246,41 +329,663 @@
  	    charging, full, true, currentValid);
  }
  
@@ -469,6 +483,9 @@ surya_time_tick until the saved time is applied.
 +	percent = percent < 1u ? 1u : (percent > 100u ? 100u : percent);
 +	publish(percent, mv, fLastMa, external, capable, charging, full, true, true);
 +	fPublished = true;
++	fLedExt = external;
++	fLedChg = charging;
++	fLedPct = percent;
 +	IOLog("SURYA BATTERY: soc=%u.%02u%% v=%umV i=%dmA ocv=%umV vsoc=%u.%02u%% ext=%d chg=%d state=%u "
 +	    "full=%d start=%s %umV s7=%umV rtc0=%u clock=%d now=%u time=%ld\n",
 +	    soc100 / 100u, soc100 % 100u, mv, fLastMa, ocv / 1000u, vsoc100 / 100u, vsoc100 % 100u,
@@ -486,6 +503,10 @@ surya_time_tick until the saved time is applied.
 +			if (!self->fTimeDone) {
 +				self->fTimeDone = surya_time_tick() != 0;
 +			}
++			if (self->fBacklight) {
++				surya_backlight_tick(self->fBacklight);
++			}
++			surya_led_tick(self->fLedExt, self->fLedChg, self->fLedPct);
 +			self->suryaSample();
 +			if (++self->fTick % SURYA_PUBLISH_N == 0) {
 +				self->suryaPoll();
@@ -511,6 +532,23 @@ surya_time_tick until the saved time is applied.
 + * sync bit 0 set then bits 3:0 cleared, module enable with 10 ms soft start.
 + * Everything set on it is still logged, up to 600 lines.
 + */
++/*
++ * Brightness across reboots (21.10): iOS reads IODisplayParameters brightness
++ * "value" as the current level and fades from it to its own setting, and the
++ * WLED keeps the bootloader's level 2047 until iOS speaks. The last non-zero
++ * brightness iOS set is kept in SURYA_BL_FILE (written 2 s after the last
++ * change, from SweetBattery's 1 s timer); once the root is mounted it is read
++ * back, applied to the WLED unless iOS already set one, and published as the
++ * current "value" instead of a fixed 512.
++ */
++#define SURYA_BL_FILE  "/private/var/db/surya-backlight"
++#define SURYA_BL_MAGIC 0x5352424cu /* "SRBL" */
++#define SURYA_BL_SAVE_NS 2000000000ULL
++
++struct surya_bl_rec {
++	uint32_t magic, version, brightness, reserved;
++};
++
 +class AppleARMBacklight : public IOService {
 +	OSDeclareDefaultStructors(AppleARMBacklight);
 +public:
@@ -519,16 +557,30 @@ surya_time_tick until the saved time is applied.
 +	IOReturn message(UInt32 type, IOService *provider, void *argument) APPLE_KEXT_OVERRIDE;
 +	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
 +	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++	void tick(void);
 +private:
 +	unsigned fLines;
 +	int fLevel;          /* WLED level now: 0 off, -1 unknown */
 +	bool fSnapshotDone;
 +	IOLock *fLock;
++	unsigned fSaved;     /* last non-zero brightness from iOS (or restored) */
++	bool fFromIOS, fDirty, fRestored;
++	uint64_t fChangedNs;
 +	void logObject(const char *what, OSObject *object);
 +	void logSnapshot(void);
 +	void applyBrightness(unsigned brightness);
++	void publishParams(unsigned value);
 +};
 +OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++static void
++surya_backlight_tick(OSObject *backlight)
++{
++	AppleARMBacklight *bl = OSDynamicCast(AppleARMBacklight, backlight);
++	if (bl) {
++		bl->tick();
++	}
++}
 +
 +void
 +AppleARMBacklight::logObject(const char *what, OSObject *object)
@@ -623,11 +675,24 @@ surya_time_tick until the saved time is applied.
 +	if (!fLock) {
 +		return false;
 +	}
++	fSaved = 0;
++	fFromIOS = fDirty = fRestored = false;
++	fChangedNs = 0;
 +	setProperty("backlight-control", kOSBooleanTrue);
++	publishParams(512);
++	registerService();
++	IOLog("SURYA BACKLIGHT: registered (backlight-control)\n");
++	return true;
++}
++
++/* IODisplayParameters brightness {min 0, max 1024, value}. */
++void
++AppleARMBacklight::publishParams(unsigned value)
++{
 +	OSDictionary *params = OSDictionary::withCapacity(1);
 +	OSDictionary *brightness = OSDictionary::withCapacity(3);
 +	OSNumber *mn = OSNumber::withNumber(0ULL, 32), *mx = OSNumber::withNumber(1024ULL, 32),
-+	    *val = OSNumber::withNumber(512ULL, 32);
++	    *val = OSNumber::withNumber((unsigned long long)value, 32);
 +	if (params && brightness && mn && mx && val) {
 +		brightness->setObject("min", mn);
 +		brightness->setObject("max", mx);
@@ -640,9 +705,42 @@ surya_time_tick until the saved time is applied.
 +	OSSafeReleaseNULL(val);
 +	OSSafeReleaseNULL(brightness);
 +	OSSafeReleaseNULL(params);
-+	registerService();
-+	IOLog("SURYA BACKLIGHT: registered (backlight-control)\n");
-+	return true;
++}
++
++/* SweetBattery's 1 s timer: restore once the root is mounted, save after changes. */
++void
++AppleARMBacklight::tick(void)
++{
++	uint64_t now = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
++	IOLockLock(fLock);
++	if (!fRestored && surya_root_ready()) {
++		fRestored = true;
++		struct surya_bl_rec rec;
++		bzero(&rec, sizeof(rec));
++		int err = surya_db_rw(SURYA_BL_FILE, 0, &rec, (int)sizeof(rec));
++		if (err || rec.magic != SURYA_BL_MAGIC || rec.version != 1 ||
++		    rec.brightness == 0 || rec.brightness > 1024) {
++			IOLog("SURYA BACKLIGHT: no saved brightness (err=%d magic=%#x value=%u)\n",
++			    err, rec.magic, rec.brightness);
++		} else {
++			bool apply = !fFromIOS;
++			if (apply) {
++				fSaved = rec.brightness;
++				applyBrightness(rec.brightness);
++			}
++			publishParams(fFromIOS ? fSaved : rec.brightness);
++			IOLog("SURYA BACKLIGHT: restored brightness %u%s\n", rec.brightness,
++			    apply ? "" : " (iOS already set one: published only)");
++		}
++	}
++	if (fDirty && fSaved && now - fChangedNs >= SURYA_BL_SAVE_NS && surya_root_ready()) {
++		fDirty = false;
++		struct surya_bl_rec rec = {SURYA_BL_MAGIC, 1, fSaved, 0};
++		int err = surya_db_rw(SURYA_BL_FILE, 1, &rec, (int)sizeof(rec));
++		IOLog("SURYA BACKLIGHT: saved brightness %u err=%d\n", fSaved, err);
++	}
++	IOLockUnlock(fLock);
 +}
 +
 +IOReturn
@@ -658,7 +756,14 @@ surya_time_tick until the saved time is applied.
 +	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
 +	OSNumber *b = dict ? OSDynamicCast(OSNumber, dict->getObject("brightness")) : NULL;
 +	if (b) {
-+		applyBrightness(b->unsigned32BitValue());
++		unsigned v = b->unsigned32BitValue();
++		applyBrightness(v);
++		fFromIOS = true;
++		if (v) { /* 0 is the display going off, not a setting */
++			fSaved = v > 1024u ? 1024u : v;
++			fDirty = true;
++			absolutetime_to_nanoseconds(mach_absolute_time(), &fChangedNs);
++		}
 +	}
 +	IOLockUnlock(fLock);
 +	return kIOReturnSuccess;
@@ -732,11 +837,24 @@ surya_time_tick until the saved time is applied.
 +	DTEntry blNode;
 +	if (fSurya && SecureDTLookupEntry(NULL, "/backlight", &blNode) == kSuccess) {
 +		AppleARMBacklight *bl = OSTypeAlloc(AppleARMBacklight);
-+		if (bl && bl->init() && bl->attach(this) && !bl->start(this)) {
-+			bl->detach(this);
++		if (bl && bl->init() && bl->attach(this)) {
++			if (bl->start(this)) {
++				bl->retain();
++				fBacklight = bl; /* read by the timer after this store */
++			} else {
++				bl->detach(this);
++			}
 +		}
 +		OSSafeReleaseNULL(bl);
 +	}
  	return true;
  }
  
+@@ -314,6 +1019,7 @@
+ {
+ 	OSSafeReleaseNULL(fTimer);
+ 	OSSafeReleaseNULL(fLoop);
++	OSSafeReleaseNULL(fBacklight);
+ 	IOPMPowerSource::free();
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
