@@ -1,0 +1,22 @@
+sweet: file-system trace for named processes (failing syscalls)
+
+unix_syscall prints every failing system call of a process named in
+boot-arg sweetfstrace: "FS name[pid] syscall N -> error".
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -180,6 +180,15 @@
+ 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
+ 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* surya: failing system calls of processes named in sweetfstrace (bsd/vfs/vfs_lookup.c). */
++	if (error != 0 && error != EJUSTRETURN && error != ERESTART) {
++		extern bool sweet_fstrace_wanted(proc_t p);
++		if (sweet_fstrace_wanted(proc)) {
++			printf("FS %s[%d] syscall %u -> %d\n", proc->p_comm, proc_getpid(proc), (unsigned)code, error);
++		}
++	}
++#endif
+ 
+ #if CONFIG_MACF
+ skip_syscall:

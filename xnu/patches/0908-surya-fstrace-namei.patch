@@ -1,0 +1,92 @@
+sweet: file-system trace for named processes (paths)
+
+A daemon that fails on a missing or broken path logs nothing we can see
+(tzinit left /var/db/timezone/zoneinfo absent and exited 0). namei now
+prints every lookup of a process named in boot-arg sweetfstrace:
+"FS name[pid] namei op N path -> error".
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -162,6 +162,63 @@
+  *		lookup: ???
+  *		VNOP_READLINK:???
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/pexpert.h>
++/*
++ * surya: file-system trace for named processes. A daemon that fails on a
++ * missing or broken path (tzinit left /var/db/timezone/zoneinfo absent and
++ * exited 0) logs nothing we can see; this prints every path it looks up and,
++ * from unix_syscall (bsd/dev/arm/systemcalls.c), every system call that fails:
++ *   FS name[pid] namei op N path -> error      (op: 0 lookup, 1 create, 2 delete, 3 rename)
++ *   FS name[pid] syscall N -> error
++ * Boot-arg sweetfstrace: comma separated process names; absent or "-" = off.
++ */
++static char sweet_fstrace_names[128];
++static int sweet_fstrace_state;         /* 0 not parsed, 1 off, 2 on */
++
++bool sweet_fstrace_wanted(proc_t p);
++
++bool
++sweet_fstrace_wanted(proc_t p)
++{
++	if (sweet_fstrace_state == 0) {
++		if (!PE_parse_boot_argn("sweetfstrace", sweet_fstrace_names, sizeof(sweet_fstrace_names)) ||
++		    sweet_fstrace_names[0] == '-' || sweet_fstrace_names[0] == '\0') {
++			sweet_fstrace_state = 1;
++		} else {
++			sweet_fstrace_state = 2;
++		}
++	}
++	if (sweet_fstrace_state != 2 || p == PROC_NULL) {
++		return false;
++	}
++	size_t n = strlen(p->p_comm);
++	for (const char *t = sweet_fstrace_names; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == n && n > 0 && strncmp(t, p->p_comm, n) == 0) {
++			return true;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++
++static void
++sweet_fstrace_namei(struct nameidata *ndp, proc_t p, int error)
++{
++	if (!sweet_fstrace_wanted(p)) {
++		return;
++	}
++	printf("FS %s[%d] namei op %u %s -> %d\n", p->p_comm, proc_getpid(p),
++	    (unsigned)ndp->ni_cnd.cn_nameiop,
++	    ndp->ni_cnd.cn_pnbuf != NULL ? ndp->ni_cnd.cn_pnbuf : "?", error);
++}
++#endif
++
+ int
+ namei(struct nameidata *ndp)
+ {
+@@ -493,6 +550,9 @@
+ 				}
+ 			}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			sweet_fstrace_namei(ndp, p, 0);
++#endif
+ 			return 0;
+ 		}
+ 
+@@ -529,6 +589,9 @@
+ 		vnode_put(ndp->ni_vp);
+ 	}
+ error_out:
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_fstrace_namei(ndp, p, error);
++#endif
+ 	if (startdir_with_usecount) {
+ 		vnode_rele(startdir_with_usecount);
+ 		startdir_with_usecount = NULLVP;
