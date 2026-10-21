@@ -195,7 +195,7 @@ calls, its threads (22.10: a 1 s vibration was never stopped by iOS).
  		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
  		    (charging ? kIOBatteryCharge : 0))};
  		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
-@@ -246,41 +330,807 @@
+@@ -246,41 +330,793 @@
  	    charging, full, true, currentValid);
  }
  
@@ -827,7 +827,6 @@ calls, its threads (22.10: a 1 s vibration was never stopped by iOS).
 +extern "C" int proc_selfpid(void);
 +extern "C" void proc_selfname(char *buf, int size);
 +extern "C" void sweet_sample_task(const char *name, int pid, task_t task); /* osfmk/kern/exception.c */
-+extern "C" int copyin(const user_addr_t uaddr, void *kaddr, size_t len);
 +
 +class SuryaVibrator : public IOService {
 +	OSDeclareDefaultStructors(SuryaVibrator);
@@ -884,19 +883,6 @@ calls, its threads (22.10: a 1 s vibration was never stopped by iOS).
 +		OSSafeReleaseNULL(s);
 +		if (fLines <= 2) {
 +			sweet_sample_task(who, pid, current_task());
-+			/* 22.10: iOS's 1 s stop timer never fired. Does the caller's clock
-+			 * (CNTVCT_EL0 + commpage timebase offset, as libsystem_kernel's
-+			 * mach_absolute_time) agree with the kernel's? */
-+			uint64_t off = 0, cnt, mat;
-+			uint8_t mode = 0xee;
-+			int e1 = copyin((user_addr_t)0x0000000FFFFFC088ULL, &off, sizeof(off));
-+			int e2 = copyin((user_addr_t)0x0000000FFFFFC090ULL, &mode, sizeof(mode));
-+			__asm__ volatile ("isb" ::: "memory");
-+			cnt = __builtin_arm_rsr64("CNTVCT_EL0");
-+			mat = mach_absolute_time();
-+			IOLog("SURYA VIB: clocks: kernel %#llx; caller CNTVCT %#llx + commpage %#llx (err %d) "
-+			    "= %#llx, user timebase mode %u (err %d); caller - kernel %lld ticks\n",
-+			    mat, cnt, off, e1, cnt + off, mode, e2, (long long)(cnt + off - mat));
 +		}
 +	}
 +	if (OSDynamicCast(OSNumber, properties)) {
@@ -1006,7 +992,7 @@ calls, its threads (22.10: a 1 s vibration was never stopped by iOS).
  	return true;
  }
  
-@@ -314,6 +1164,8 @@
+@@ -314,6 +1150,8 @@
  {
  	OSSafeReleaseNULL(fTimer);
  	OSSafeReleaseNULL(fLoop);
