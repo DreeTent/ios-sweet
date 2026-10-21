@@ -43,6 +43,11 @@ frequency (PMU cycle counter against the 19.2 MHz counter), copy speeds
 rate, and whether 1 s thread_calls on the absolute and continuous clocks
 fire; then every 10 s swaps, repeated swaps, panel copy times, vsync
 ticks, panel frames, per-CPU idle share and TSENS temperatures.
+CPU clocks, suryafreq=max or suryafreq=S,B,L (22.10): row numbers of the
+OSM tables for the small cluster, the big one and L3, written to
+DCVS_PERF_STATE_DESIRED as Linux's clk-cpu-osm does, 65 s after start;
+at 85 C (TSENS) the bootloader's rows come back until below 70 C. Without
+the boot-arg nothing is written.
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
 @@ -14,12 +14,29 @@
@@ -75,7 +80,7 @@ ticks, panel frames, per-CPU idle share and TSENS temperatures.
  void sweet_touch_init(void);
  
  #define TOUCH_SE_PA      0x00a84000u
-@@ -635,6 +652,2563 @@
+@@ -635,6 +652,2721 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -2636,10 +2641,168 @@ ticks, panel frames, per-CPU idle share and TSENS temperatures.
 +	}
 +}
 +
++/*
++ * CPU clocks, boot-arg suryafreq (wishes/04, step 4). Nothing changes them
++ * otherwise: the bootloader's rows stay. The OSM takes a row number of its
++ * table per core (DCVS_PERF_STATE_DESIRED, +0x920 + 4 n), as Linux's
++ * clk-cpu-osm does from EL1. suryafreq=max asks for the last row of every
++ * table (the table ends where it repeats); suryafreq=S,B,L asks rows S for
++ * the small cluster, B for the big one, L for L3 (-1 keeps one as it is).
++ * Guard: TSENS is read every second; at 85 C or more the bootloader's rows
++ * come back until every sensor is below 70 C again. Reads of the current
++ * requests and the hottest sensor go to the log once a minute.
++ */
++#define FREQ_HOT_C10   850
++#define FREQ_COOL_C10  700
++
++static struct {
++	vm_offset_t base[3];      /* small, big, L3 */
++	unsigned cores[3];
++	int want[3], boot[3][6];
++	bool throttled;
++} sfq;
++
++static int
++freq_last_row(vm_offset_t base)
++{
++	int last = 0;
++	for (unsigned i = 1; i < 40; ++i) {
++		if (touch_rd(base, 0x110u + 32u * i) == touch_rd(base, 0x110u + 32u * (i - 1u))) {
++			break;
++		}
++		last = (int)i;
++	}
++	return last;
++}
++
++static int
++freq_tsens_max(void)
++{
++	int max = -1000;
++	for (unsigned t = 0; t < 2; ++t) {
++		if (!sst.tsens[t]) {
++			continue;
++		}
++		for (unsigned s = 0; s < 16; ++s) {
++			uint32_t v = touch_rd(sst.tsens[t], 0xa0u + 4u * s);
++			if (!(v & (1u << 21))) {
++				continue;
++			}
++			int temp = (int)(v & 0xfffu);
++			if (temp & 0x800) {
++				temp -= 0x1000;
++			}
++			if (temp > max) {
++				max = temp;
++			}
++		}
++	}
++	return max;
++}
++
++static void
++freq_apply(bool boot_rows)
++{
++	static const char *const names[3] = {"small", "big", "L3"};
++	for (unsigned k = 0; k < 3; ++k) {
++		if (!sfq.base[k] || (!boot_rows && sfq.want[k] < 0)) {
++			continue;
++		}
++		for (unsigned c = 0; c < sfq.cores[k]; ++c) {
++			touch_wr(sfq.base[k], 0x920u + 4u * c, (uint32_t)(boot_rows ? sfq.boot[k][c] : sfq.want[k]));
++		}
++		printf("SURYA FREQ: %s cluster -> row %d%s (read back c0 %u)\n", names[k],
++		    boot_rows ? sfq.boot[k][0] : sfq.want[k], boot_rows ? " (bootloader's)" : "",
++		    touch_rd(sfq.base[k], 0x920u));
++	}
++}
++
++static void
++surya_freq_thread(void *arg, wait_result_t result)
++{
++	char spec[32] = "";
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("suryafreq", spec, sizeof(spec));
++	touch_wait(65000);
++	sfq.base[0] = ml_io_map(STAT_OSM_PWR_PA, 0x1400);
++	sfq.base[1] = ml_io_map(STAT_OSM_PERF_PA, 0x1400);
++	sfq.base[2] = ml_io_map(STAT_OSM_L3_PA, 0x1400);
++	sfq.cores[0] = 6;
++	sfq.cores[1] = 2;
++	sfq.cores[2] = 1;
++	if (!sst.tsens[0]) {
++		sst.tsens[0] = ml_io_map(STAT_TSENS0_PA, 0x1000);
++		sst.tsens[1] = ml_io_map(STAT_TSENS1_PA, 0x1000);
++	}
++	for (unsigned k = 0; k < 3; ++k) {
++		if (!sfq.base[k] || !(touch_rd(sfq.base[k], 0) & 1u)) {
++			printf("SURYA FREQ: OSM %u not mapped or not enabled; left alone\n", k);
++			sfq.base[k] = 0;
++			continue;
++		}
++		for (unsigned c = 0; c < sfq.cores[k]; ++c) {
++			sfq.boot[k][c] = (int)touch_rd(sfq.base[k], 0x920u + 4u * c);
++		}
++	}
++	if (strcmp(spec, "max") == 0) {
++		for (unsigned k = 0; k < 3; ++k) {
++			sfq.want[k] = sfq.base[k] ? freq_last_row(sfq.base[k]) : -1;
++		}
++	} else {
++		const char *p = spec;
++		for (unsigned k = 0; k < 3; ++k) {
++			sfq.want[k] = -1;
++			if (*p == '-') {
++				sfq.want[k] = -1;
++				++p;
++				if (*p == '1') {
++					++p;
++				}
++			} else {
++				int v = 0;
++				bool any = false;
++				while (*p >= '0' && *p <= '9') {
++					v = v * 10 + (*p++ - '0');
++					any = true;
++				}
++				sfq.want[k] = any ? (v > 39 ? 39 : v) : -1;
++			}
++			if (*p == ',') {
++				++p;
++			}
++		}
++	}
++	printf("SURYA FREQ: \"%s\" -> rows small %d big %d L3 %d (bootloader: %d %d %d); hot at %d C, cool at %d C\n",
++	    spec, sfq.want[0], sfq.want[1], sfq.want[2], sfq.boot[0][0], sfq.boot[1][0], sfq.boot[2][0],
++	    FREQ_HOT_C10 / 10, FREQ_COOL_C10 / 10);
++	freq_apply(false);
++	unsigned tick = 0;
++	for (;;) {
++		touch_wait(1000);
++		int t = freq_tsens_max();
++		if (!sfq.throttled && t >= FREQ_HOT_C10) {
++			sfq.throttled = true;
++			printf("SURYA FREQ: %d.%d C: back to the bootloader's rows\n", t / 10, t % 10);
++			freq_apply(true);
++		} else if (sfq.throttled && t < FREQ_COOL_C10) {
++			sfq.throttled = false;
++			printf("SURYA FREQ: %d.%d C: requested rows again\n", t / 10, t % 10);
++			freq_apply(false);
++		}
++		if (++tick % 60 == 0) {
++			printf("SURYA FREQ: requests small %u big %u L3 %u, hottest %d.%d C%s\n",
++			    sfq.base[0] ? touch_rd(sfq.base[0], 0x920u) : 0, sfq.base[1] ? touch_rd(sfq.base[1], 0x920u) : 0,
++			    sfq.base[2] ? touch_rd(sfq.base[2], 0x920u) : 0, t / 10, (t < 0 ? -t : t) % 10,
++			    sfq.throttled ? " (throttled)" : "");
++		}
++	}
++}
++
  void
  sweet_touch_init(void)
  {
-@@ -644,17 +3218,46 @@
+@@ -644,17 +3376,56 @@
  		return;
  	}
  	st.started = true;
@@ -2671,6 +2834,16 @@ ticks, panel frames, per-CPU idle share and TSENS temperatures.
 +			thread_deallocate(thread);
 +		} else {
 +			printf("SURYA STAT: kernel_thread_start failed %d\n", kr);
++		}
++	}
++	/* suryafreq=...: CPU clock requests with the thermal guard above. */
++	char spec[32] = "";
++	if (enabled == 2 && PE_parse_boot_argn("suryafreq", spec, sizeof(spec)) && spec[0]) {
++		kr = kernel_thread_start(surya_freq_thread, NULL, &thread);
++		if (kr == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			printf("SURYA FREQ: kernel_thread_start failed %d\n", kr);
 +		}
 +	}
 +	/* surya's vibration motor, unless suryavib=0. */
