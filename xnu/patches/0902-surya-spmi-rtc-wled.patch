@@ -24,7 +24,7 @@ still only from this list and only through the APPS-owned channel.
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <sys/param.h>
-@@ -83,14 +86,108 @@
+@@ -83,14 +86,110 @@
  	return 0;
  }
  
@@ -44,7 +44,9 @@ still only from this list and only through the APPS-owned channel.
 +	0xd846, 0xd953, 0xd954, 0xd965,                 /* WLED5: module enable, brightness, sync */
 +	0xd340, 0xd341, 0xd343, 0xd344, 0xd346, 0xd347, /* flash LED: timers, current, module, step */
 +	0xd349, 0xd34a, 0xd34c, 0xd3ec,                 /* strobe, channel enable, torch clamp */
-+	0xb141, 0xb142, 0xb143, 0xb144, 0xb145, 0xb146, 0xb147, /* LPG channel 0 PWM */
++	0xb141, 0xb142, 0xb143, 0xb144, 0xb145, 0xb146, 0xb147, /* LPG channel 0 PWM (white LED) */
++	0xb241, 0xb242, 0xb243, 0xb244, 0xb245, 0xb246, 0xb247, /* LPG channels 1, 2: TRILED */
++	0xb341, 0xb342, 0xb343, 0xb344, 0xb345, 0xb346, 0xb347, /* green/blue, for suryaledtest=2 */
 +	0xd046,                                         /* TRILED enable */
 +};
 +
@@ -131,7 +133,7 @@ still only from this list and only through the APPS-owned channel.
 +	/* surya: PM6150L on SID 5: WLED5 control and sink (backlight), flash LED
 +	 * (torch), LPG channel 0 and TRILED (notification LED). */
 +	bool sid5 = sid == 5 && (peripheral == 0xd8 || peripheral == 0xd9 || peripheral == 0xd3 ||
-+	    peripheral == 0xb1 || peripheral == 0xd0);
++	    peripheral == 0xb1 || peripheral == 0xb2 || peripheral == 0xb3 || peripheral == 0xd0);
 +	if (!sp_ready || !out || addr > 0xffffu || (!sid0 && !sid5)) {
  		return -1;
  	}

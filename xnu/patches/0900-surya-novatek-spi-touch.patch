@@ -52,7 +52,7 @@ writes the small state files in /private/var/db (time, backlight).
  void sweet_touch_init(void);
  
  #define TOUCH_SE_PA      0x00a84000u
-@@ -635,6 +648,1430 @@
+@@ -635,6 +648,1477 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -1395,12 +1395,17 @@ writes the small state files in /private/var/db (time, backlight).
 +	if (surya_led_ok >= 0) {
 +		return surya_led_ok;
 +	}
-+	uint8_t type = 0xee, subtype = 0xee, en = 0xee;
++	uint8_t type = 0xee, subtype = 0xee, en = 0xee, ttype = 0xee, tsub = 0xee;
 +	unsigned lapid = 0, tapid = 0;
 +	int lown = sweet_spmi_owner(5, 0xb1, &lapid), town = sweet_spmi_owner(5, 0xd0, &tapid);
 +	int err = sweet_spmi_read(5, 0xb104, &type);
 +	err |= sweet_spmi_read(5, 0xb105, &subtype);
 +	err |= sweet_spmi_read(5, 0xd046, &en);
++	(void)sweet_spmi_read(5, 0xd004, &ttype);
++	(void)sweet_spmi_read(5, 0xd005, &tsub);
++	printf("SURYA LED: triled type %#x subtype %#x (Xiaomi: type 0x19; subtype 0x03 LED2H0L12 "
++	    "needs a PBS trigger), lpg ch1/ch2 owners %d/%d\n", ttype, tsub,
++	    sweet_spmi_owner(5, 0xb2, NULL), sweet_spmi_owner(5, 0xb3, NULL));
 +	/* surya reads subtype 0x11, LPG_SUBTYPE_LPG_LITE (21.10); the full LPG is 0x02. */
 +	surya_led_ok = !err && lown == 0 && town == 0 && (subtype == 0x11 || subtype == 0x02);
 +	surya_led_size = subtype == 0x02 ? 0x30 : 0x10; /* lpg_apply_freq: LPG GENMASK(5,4), Lite BIT(4) */
@@ -1409,33 +1414,62 @@ writes the small state files in /private/var/db (time, backlight).
 +	return surya_led_ok;
 +}
 +
++/*
++ * One LPG channel (0..2 = TRILED red/green/blue; surya's white LED is "red",
++ * label "white" in Xiaomi's pm6150l.dtsi) on or off. Each change reads the
++ * registers back into the log (the first 60): on 21.10 every write succeeded
++ * but the LED stayed dark, so the log must show what the hardware holds.
++ */
++static int
++surya_led_chan(unsigned ch, unsigned duty)
++{
++	unsigned b = 0xb100u + 0x100u * ch;
++	uint8_t bit = (uint8_t)(0x80u >> ch);
++	int err = 0;
++	if (duty) {
++		uint8_t tc = 0;
++		err |= sweet_spmi_read(5, b + 0x43, &tc);
++		err |= sweet_spmi_write(5, b + 0x43, (uint8_t)(tc | 0x20u));  /* glitch removal off */
++		err |= sweet_spmi_write(5, b + 0x41, (uint8_t)(0x03u | surya_led_size)); /* 19.2 MHz */
++		err |= sweet_spmi_write(5, b + 0x42, 0x43);                   /* pre-divide 5, 2^3 */
++		err |= sweet_spmi_write(5, b + 0x44, (uint8_t)(duty & 0xffu));
++		err |= sweet_spmi_write(5, b + 0x45, (uint8_t)(duty >> 8));
++		err |= sweet_spmi_write(5, b + 0x46, 0xa4);                   /* output, tristate, PWM */
++		err |= sweet_spmi_write(5, b + 0x44, (uint8_t)(duty & 0xffu));
++		err |= sweet_spmi_write(5, b + 0x45, (uint8_t)(duty >> 8));
++		err |= sweet_spmi_write(5, b + 0x47, 0x01);                   /* sync */
++		err |= sweet_spmi_write(5, b + 0x43, (uint8_t)(tc & ~0x20u)); /* glitch removal on */
++		err |= sweet_spmi_write(5, 0xd046, bit);                      /* TRILED channel */
++	} else {
++		err |= sweet_spmi_write(5, 0xd046, 0x00);
++		err |= sweet_spmi_write(5, b + 0x46, 0x24);
++	}
++	static unsigned logged;
++	if (logged < 60) {
++		++logged;
++		uint8_t r[9];
++		static const uint8_t off[7] = {0x08, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46};
++		for (unsigned i = 0; i < 7; ++i) {
++			r[i] = 0xee;
++			(void)sweet_spmi_read(5, b + off[i], &r[i]);
++		}
++		r[7] = r[8] = 0xee;
++		(void)sweet_spmi_read(5, 0xd008, &r[7]);
++		(void)sweet_spmi_read(5, 0xd046, &r[8]);
++		printf("SURYA LED: ch %u duty %u%s | sts %02x size %02x prediv %02x type %02x "
++		    "val %02x%02x en %02x | triled sts %02x en %02x\n", ch, duty, err ? " FAILED" : "",
++		    r[0], r[1], r[2], r[3], r[5], r[4], r[6], r[7], r[8]);
++	}
++	return err ? -1 : 0;
++}
++
 +static int
 +surya_led_set(unsigned duty)
 +{
 +	if (duty == surya_led_duty || !surya_led_check()) {
 +		return 0;
 +	}
-+	int err = 0;
-+	if (duty) {
-+		uint8_t tc = 0;
-+		err |= sweet_spmi_read(5, 0xb143, &tc);
-+		err |= sweet_spmi_write(5, 0xb143, (uint8_t)(tc | 0x20u));  /* glitch removal off */
-+		err |= sweet_spmi_write(5, 0xb141, (uint8_t)(0x03u | surya_led_size)); /* 19.2 MHz */
-+		err |= sweet_spmi_write(5, 0xb142, 0x43);                   /* pre-divide 5, 2^3 */
-+		err |= sweet_spmi_write(5, 0xb144, (uint8_t)(duty & 0xffu));
-+		err |= sweet_spmi_write(5, 0xb145, (uint8_t)(duty >> 8));
-+		err |= sweet_spmi_write(5, 0xb146, 0xa4);                   /* output, tristate, PWM */
-+		err |= sweet_spmi_write(5, 0xb144, (uint8_t)(duty & 0xffu));
-+		err |= sweet_spmi_write(5, 0xb145, (uint8_t)(duty >> 8));
-+		err |= sweet_spmi_write(5, 0xb147, 0x01);                   /* sync */
-+		err |= sweet_spmi_write(5, 0xb143, (uint8_t)(tc & ~0x20u)); /* glitch removal on */
-+		err |= sweet_spmi_write(5, 0xd046, 0x80);                   /* TRILED channel 0 */
-+	} else {
-+		err |= sweet_spmi_write(5, 0xd046, 0x00);
-+		err |= sweet_spmi_write(5, 0xb146, 0x24);
-+	}
-+	if (err) {
-+		printf("SURYA LED: duty %u FAILED\n", duty);
++	if (surya_led_chan(0, duty)) {
 +		surya_led_ok = 0;
 +		return -1;
 +	}
@@ -1457,7 +1491,20 @@ writes the small state files in /private/var/db (time, backlight).
 +		(void)PE_parse_boot_argn("suryaledtest", &test, sizeof(test));
 +	}
 +	unsigned want = 0;
-+	if (test && tick <= 20) {
++	if (test == 2 && tick <= 16) {
++		/* suryaledtest=2: channels 0, 1, 2 at 100 % for 5 s each, then off. */
++		if (surya_led_check() && (tick == 1 || tick == 6 || tick == 11 || tick == 16)) {
++			unsigned ch = (tick - 1u) / 5u;
++			if (ch > 0) {
++				(void)surya_led_chan(ch - 1u, 0);
++			}
++			if (ch < 3) {
++				(void)surya_led_chan(ch, 511);
++			}
++		}
++		return;
++	}
++	if (test == 1 && tick <= 20) {
 +		want = (tick & 1u) ? SURYA_LED_DUTY : 0; /* suryaledtest=1: 10 blinks at start */
 +	} else if (!surya_disp_on) {
 +		if (charging) {
@@ -1483,7 +1530,7 @@ writes the small state files in /private/var/db (time, backlight).
  void
  sweet_touch_init(void)
  {
-@@ -644,13 +2081,16 @@
+@@ -644,13 +2128,16 @@
  		return;
  	}
  	st.started = true;
