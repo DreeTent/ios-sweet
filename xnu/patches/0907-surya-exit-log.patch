@@ -1,0 +1,83 @@
+sweet: log every process exit with status and reason
+
+A daemon that launchd keeps alive (fairplayd.H2) was restarted every 10 s
+with no crash line: an exit() or a kill left nothing in the log. Now
+exit_with_reason prints "EXIT name[pid] exit N signal N by name[pid]" and the
+os_reason namespace, code and description. Boot-arg sweetexit: comma
+separated names, "*" all (default), "-" off.
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1464,6 +1464,63 @@
+ /*
+  * NOTE: exit_with_reason drops a reference on the passed exit_reason
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * surya: which process exits, with what status and why. A daemon that launchd
++ * keeps alive (fairplayd.H2) was restarted every 10 s with no crash line: an
++ * exit() or a kill left nothing else in the log. Boot-arg sweetexit: comma
++ * separated process names, "*" all (default), "-" off.
++ */
++static void
++sweet_exit_log(proc_t p, int rv, struct os_reason *reason)
++{
++	static char names[128];
++	static int parsed;
++	char by[MAXCOMLEN + 1];
++	char *desc;
++
++	if (!parsed) {
++		if (!PE_parse_boot_argn("sweetexit", names, sizeof(names))) {
++			strlcpy(names, "*", sizeof(names));
++		}
++		parsed = 1;
++	}
++	if (names[0] == '-') {
++		return;
++	}
++	if (names[0] != '*') {
++		size_t n = strlen(p->p_comm);
++		bool hit = false;
++		for (const char *t = names; *t;) {
++			const char *end = strchr(t, ',');
++			size_t tl = end ? (size_t)(end - t) : strlen(t);
++			if (tl == n && n > 0 && strncmp(t, p->p_comm, n) == 0) {
++				hit = true;
++				break;
++			}
++			if (!end) {
++				break;
++			}
++			t = end + 1;
++		}
++		if (!hit) {
++			return;
++		}
++	}
++	proc_selfname(by, (int)sizeof(by));
++	if (reason == OS_REASON_NULL) {
++		printf("EXIT %s[%d] exit %d signal %d by %s[%d]\n", p->p_comm, proc_getpid(p),
++		    WEXITSTATUS(rv), WTERMSIG(rv), by, proc_getpid(current_proc()));
++		return;
++	}
++	desc = exit_reason_get_string_desc(reason);
++	printf("EXIT %s[%d] exit %d signal %d by %s[%d] reason ns %u code 0x%llx: %s\n",
++	    p->p_comm, proc_getpid(p), WEXITSTATUS(rv), WTERMSIG(rv), by,
++	    proc_getpid(current_proc()), reason->osr_namespace, reason->osr_code,
++	    desc != NULL ? desc : "(none)");
++}
++#endif
++
+ int
+ exit_with_reason(proc_t p, int rv, int *retval, boolean_t thread_can_terminate, boolean_t perf_notify,
+     int jetsam_flags, struct os_reason *exit_reason)
+@@ -1583,6 +1640,9 @@
+ 	proc_transend(p, 1);
+ 	proc_unlock(p);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_exit_log(p, rv, exit_reason);
++#endif
+ 	proc_prepareexit(p, rv, perf_notify);
+ 
+ 	/* Last thread to terminate will call proc_exit() */
