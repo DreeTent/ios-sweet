@@ -52,7 +52,7 @@ writes the small state files in /private/var/db (time, backlight).
  void sweet_touch_init(void);
  
  #define TOUCH_SE_PA      0x00a84000u
-@@ -635,6 +648,1477 @@
+@@ -635,6 +648,1527 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -1355,11 +1355,23 @@ writes the small state files in /private/var/db (time, backlight).
 + * 1 volume up, 2 volume down). */
 +void surya_keys_poll(const int now[3]);
 +
++static void surya_led_test_step(void);
++
 +void
 +surya_keys_poll(const int now[3])
 +{
-+	static unsigned held;
-+	static bool fired;
++	static unsigned held, held_up;
++	static bool fired, fired_up;
++	/* volume up held 800 ms with the display off: next LED test step */
++	if (!now[1]) {
++		held_up = 0;
++		fired_up = false;
++	} else if (++held_up >= 40 && !fired_up) {
++		fired_up = true;
++		if (!surya_disp_on) {
++			surya_led_test_step();
++		}
++	}
 +	if (!now[2]) {
 +		held = 0;
 +		fired = false;
@@ -1477,6 +1489,37 @@ writes the small state files in /private/var/db (time, backlight).
 +	return 0;
 +}
 +
++/*
++ * LED test on demand (21.10: two boot-time tests went unseen): each long
++ * volume-up press with the display off moves to the next step, channel 0, 1,
++ * 2 at 100 %, then off and back to normal control. Every step is logged with
++ * the registers read back.
++ */
++static volatile unsigned surya_led_testing; /* 0 normal; 1..3 = channel + 1 lit */
++
++static void
++surya_led_test_step(void)
++{
++	if (!surya_led_check()) {
++		printf("SURYA LED: test refused, LED not usable\n");
++		return;
++	}
++	unsigned step = surya_led_testing;
++	if (step) {
++		(void)surya_led_chan(step - 1u, 0);
++	} else if (surya_led_duty) {
++		(void)surya_led_chan(0, 0);
++		surya_led_duty = 0;
++	}
++	step = step >= 3u ? 0u : step + 1u;
++	if (step) {
++		(void)surya_led_chan(step - 1u, 511);
++	}
++	surya_led_testing = step;
++	printf("SURYA LED: test step %u (%s)\n", step,
++	    step ? (step == 1 ? "channel 0 = white" : step == 2 ? "channel 1" : "channel 2") : "off");
++}
++
 +/* Every second from SweetBattery's timer, with the last published state. */
 +void surya_led_tick(int external, int charging, unsigned percent);
 +
@@ -1491,6 +1534,9 @@ writes the small state files in /private/var/db (time, backlight).
 +		(void)PE_parse_boot_argn("suryaledtest", &test, sizeof(test));
 +	}
 +	unsigned want = 0;
++	if (surya_led_testing) {
++		return; /* a volume-up test step owns the LED */
++	}
 +	if (test == 2 && tick <= 16) {
 +		/* suryaledtest=2: channels 0, 1, 2 at 100 % for 5 s each, then off. */
 +		if (surya_led_check() && (tick == 1 || tick == 6 || tick == 11 || tick == 16)) {
@@ -1525,12 +1571,16 @@ writes the small state files in /private/var/db (time, backlight).
 +	if (surya_led_duty) {
 +		(void)surya_led_set(0);
 +	}
++	if (surya_led_testing) {
++		(void)surya_led_chan(surya_led_testing - 1u, 0);
++		surya_led_testing = 0;
++	}
 +}
 +
  void
  sweet_touch_init(void)
  {
-@@ -644,13 +2128,16 @@
+@@ -644,13 +2178,16 @@
  		return;
  	}
  	st.started = true;
