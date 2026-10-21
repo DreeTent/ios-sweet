@@ -6,6 +6,12 @@ double tap to wake, the torch's long press and the notification LED depend on it
 Also (22.10) counters for suryastat=1 (bsd/dev/sweet_touch.c reads them):
 swaps, swaps whose first layer samples like the previous one, panel copies
 and their time, vsync ticks, and the panel memory for the copy speed test.
+suryafb=1 (22.10, wishes/04 step 6): the panel copy runs on its own kernel
+thread instead of inside the vsync timer, the timer keeps absolute deadlines
+(wakeAtTime) so copies no longer stretch its period, and SwapWait waits (at
+most 50 ms) until the pending frame has been copied, so CoreAnimation gets
+real back-pressure instead of rendering frames nobody shows. Without the
+boot-arg the old path is unchanged.
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -37,6 +37,8 @@
@@ -17,29 +23,17 @@ and their time, vsync ticks, and the panel memory for the copy speed test.
  
  #if defined(SWEET)
  #include <IOKit/IOService.h>
-@@ -195,6 +197,11 @@
- 	uint32_t hz = 10;
- 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
- 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
-+	PE_parse_boot_argn("suryastat", &sweet_fb_stat_on, sizeof(sweet_fb_stat_on));
-+	sweet_fb_stat_pixels = fPixels;
-+	sweet_fb_stat_rowbytes = fRowBytes;
-+	sweet_fb_stat_width = fWidth;
-+	sweet_fb_stat_height = fHeight;
- 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -49,6 +51,7 @@
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
+ #include <sys/proc.h>
  
- 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
-@@ -212,6 +219,7 @@
- 	AppleCLCD *fb = (AppleCLCD *)owner;
- 	uint64_t now = mach_absolute_time();
- 	uint64_t count = ++fb->fVsyncCount;
-+	sweet_fb_stat_ticks = count;
- 	uint64_t values[6] = {
- 		(uint32_t)count, (uint32_t)(count >> 32),
- 		(uint32_t)now, (uint32_t)(now >> 32),
-@@ -289,6 +297,50 @@
- static uint32_t sweet_fb_swaps_logged;
- static uint64_t sweet_fb_swap_count;
+ enum {
+@@ -82,6 +85,20 @@
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
  
 +/*
 + * surya measurements (boot-arg suryastat=1, read by bsd/dev/sweet_touch.c):
@@ -54,6 +48,165 @@ and their time, vsync ticks, and the panel memory for the copy speed test.
 +uintptr_t sweet_fb_stat_pixels;
 +uint32_t sweet_fb_stat_rowbytes, sweet_fb_stat_width, sweet_fb_stat_height;
 +}
++
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ };
+@@ -116,13 +133,23 @@
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	/* surya, suryafb=1 (wishes/04 step 6): the panel copy runs on its own
++	 * thread, the vsync timer keeps absolute deadlines, SwapWait waits for
++	 * the copy. Without the boot-arg everything is as before. */
++	bool          fCopyWanted;
++	uint64_t      fNextVsync, fVsyncPeriod;
++	uint8_t       fCopyRec[SWEET_FB_SWAP_REC_SIZE];
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void copyLoop(void);
++	void swapWait(void);
+ };
++static int surya_fb_mode;
++static void surya_fb_copy_thread(void *arg, wait_result_t wr);
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+@@ -195,7 +222,29 @@
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	PE_parse_boot_argn("suryastat", &sweet_fb_stat_on, sizeof(sweet_fb_stat_on));
++	sweet_fb_stat_pixels = fPixels;
++	sweet_fb_stat_rowbytes = fRowBytes;
++	sweet_fb_stat_width = fWidth;
++	sweet_fb_stat_height = fHeight;
++	PE_parse_boot_argn("suryafb", &surya_fb_mode, sizeof(surya_fb_mode));
++	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000ULL, &fVsyncPeriod);
++	if (surya_fb_mode) {
++		thread_t t;
++		if (kernel_thread_start(surya_fb_copy_thread, this, &t) == KERN_SUCCESS) {
++			thread_deallocate(t);
++			IOLog("SWEET FB: surya mode %d: copy thread, absolute vsync, SwapWait waits\n", surya_fb_mode);
++		} else {
++			surya_fb_mode = 0;
++			IOLog("SWEET FB: copy thread failed; old mode\n");
++		}
++	}
++	fNextVsync = mach_absolute_time() + fVsyncPeriod;
++	if (surya_fb_mode) {
++		fVsync->wakeAtTime(fNextVsync);
++	} else {
++		fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -212,11 +261,20 @@
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	sweet_fb_stat_ticks = count;
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+ 		0, 0,
+ 	};
++	/* surya mode: the next deadline is fixed now, before any work; a tick
++	 * that is already late by more than a period starts a fresh series. */
++	if (surya_fb_mode) {
++		fb->fNextVsync += fb->fVsyncPeriod;
++		if (fb->fNextVsync < now) {
++			fb->fNextVsync = now + fb->fVsyncPeriod;
++		}
++	}
+ 
+ 	IOLockLock(fb->fLock);
+ 	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+@@ -239,12 +297,20 @@
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		if (surya_fb_mode) {
++			sender->wakeAtTime(fb->fNextVsync);
++		} else {
++			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		}
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
+-	if (flush) {
++	if (flush && surya_fb_mode) {
++		/* the copy thread takes it from here; SwapWait waiters see fDirty drop there */
++		fb->fCopyWanted = true;
++		IOLockWakeup(fb->fLock, &fb->fCopyWanted, false);
++	} else if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+@@ -256,7 +322,50 @@
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	if (surya_fb_mode) {
++		sender->wakeAtTime(fb->fNextVsync);
++	} else {
++		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	}
++}
++
++/* surya mode: copies the latest frame whenever the vsync timer asks. */
++void
++AppleCLCD::copyLoop(void)
++{
++	for (;;) {
++		IOLockLock(fLock);
++		while (!fCopyWanted) {
++			(void)IOLockSleep(fLock, &fCopyWanted, THREAD_UNINT);
++		}
++		fCopyWanted = false;
++		memcpy(fCopyRec, fPending, SWEET_FB_SWAP_REC_SIZE);
++		fDirty = false;
++		IOLockUnlock(fLock);
++		present(fCopyRec);
++		IOLockLock(fLock);
++		IOLockWakeup(fLock, &fDirty, false); /* SwapWait: the frame is on the panel */
++		IOLockUnlock(fLock);
++	}
++}
++
++static void
++surya_fb_copy_thread(void *arg, wait_result_t wr)
++{
++	(void)wr;
++	((AppleCLCD *)arg)->copyLoop();
++}
++
++/* surya mode SwapWait: until the pending frame has been copied, at most 50 ms. */
++void
++AppleCLCD::swapWait(void)
++{
++	uint64_t deadline = mach_absolute_time() + 3 * fVsyncPeriod;
++	IOLockLock(fLock);
++	while (fDirty && !fPowerOff && mach_absolute_time() < deadline) {
++		(void)IOLockSleepDeadline(fLock, &fDirty, deadline, THREAD_UNINT);
++	}
++	IOLockUnlock(fLock);
+ }
+ 
+ void
+@@ -289,6 +398,37 @@
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
 +static uint64_t sweet_fb_stat_last_hash;
 +
 +static void
@@ -88,7 +241,7 @@ and their time, vsync ticks, and the panel memory for the copy speed test.
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
   * A swap only records the frame: copying 10 MB into the panel on every
-@@ -303,6 +355,9 @@
+@@ -303,6 +443,9 @@
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
  	IOLockUnlock(fLock);
@@ -98,7 +251,7 @@ and their time, vsync ticks, and the panel memory for the copy speed test.
  	if ((++sweet_fb_swap_count % 1000) == 0) {
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
  	}
-@@ -391,11 +446,21 @@
+@@ -391,11 +534,21 @@
  			src = 0;
  		}
  		if (src != 0 && bpe == 4) {
@@ -120,7 +273,7 @@ and their time, vsync ticks, and the panel memory for the copy speed test.
  		}
  		s->release();
  	}
-@@ -542,6 +607,7 @@
+@@ -542,10 +695,15 @@
  				fFB->fDirty = true;     /* on: redraw the latest frame */
  			}
  			IOLockUnlock(fFB->fLock);
@@ -128,3 +281,11 @@ and their time, vsync ticks, and the panel memory for the copy speed test.
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
+ 	case kSweetFBSwapWait:
++		if (surya_fb_mode) {
++			fFB->swapWait();
++		}
++		break;
+ 	default:
+ 		break;
+ 	}
