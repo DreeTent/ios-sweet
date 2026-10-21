@@ -24,9 +24,20 @@ PWM mode), driven from SweetBattery's timer: steady while charging, blinking
 below 15 % on battery, display off only (suryaledtest=1 blinks it at start).
 Torch and LED go dark before power off and restart. surya_db_rw() reads and
 writes the small state files in /private/var/db (time, backlight).
+
+Vibration (22.10): the AW8624 on GENI SE1 in I2C mode at 400 kHz (pins
+gpio0/1, reset gpio63), started 3 s after the touch init so the USB log is up
+first: chip id 0x24, Xiaomi's aw8624_haptic_init with its f0 calibration (a
+short buzz), then CONT mode, where the chip drives the motor at resonance from
+the back-EMF and needs no waveform file. surya_vib_play() takes the patterns
+of SweetBattery's "vibrator" service (0901): pairs of intensity (16.16) and
+milliseconds, optionally repeated, played by one thread; intensity scales the
+drive level; a pattern nobody stopped ends after 120 s. The SE clock code is
+shared with the touch (surya_qup_clocks, one lock for the GCC vote register).
+suryavib=0 leaves the chip alone.
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -14,12 +14,25 @@
+@@ -14,12 +14,26 @@
  #include <kern/sched_prim.h>
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
@@ -35,6 +46,7 @@ writes the small state files in /private/var/db (time, backlight).
 +#include <sys/fcntl.h>
 +#include <sys/uio.h>
 +#include <sys/vnode.h>
++#include <IOKit/IOLocks.h>
 +#include "sweet_spmi.h"
 +
 +/* bsd/sys/vnode_internal.h */
@@ -52,7 +64,7 @@ writes the small state files in /private/var/db (time, backlight).
  void sweet_touch_init(void);
  
  #define TOUCH_SE_PA      0x00a84000u
-@@ -635,6 +648,1527 @@
+@@ -635,6 +649,2224 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -180,41 +192,58 @@ writes the small state files in /private/var/db (time, backlight).
 +	touch_wr(tile, off, cfg);
 +}
 +
++/* The GCC vote register is shared by the touch (SE0) and vibrator (SE1) threads. */
++static IOLock *surya_gcc_lock;
++
++/* One wrapper-0 SE clock: vote, XO on its RCG, every branch running. */
 +static bool
-+surya_clocks(void)
++surya_qup_clocks(vm_offset_t gcc, uint32_t vote, uint32_t rcg, uint32_t se_branch,
++    const char *who)
 +{
-+	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | SURYA_VOTE_MASK);
-+	uint32_t dfs = touch_rd(st.gcc, SURYA_RCG + 0x14u);
-+	uint32_t cfg = touch_rd(st.gcc, SURYA_RCG + 4u);
-+	printf("SURYA TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
-+	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, SURYA_RCG), cfg, dfs);
++	if (surya_gcc_lock) {
++		IOLockLock(surya_gcc_lock);
++	}
++	touch_wr(gcc, TOUCH_GCC_VOTE, touch_rd(gcc, TOUCH_GCC_VOTE) | vote);
++	if (surya_gcc_lock) {
++		IOLockUnlock(surya_gcc_lock);
++	}
++	uint32_t dfs = touch_rd(gcc, rcg + 0x14u);
++	uint32_t cfg = touch_rd(gcc, rcg + 4u);
++	printf("SURYA %s: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    who, touch_rd(gcc, TOUCH_GCC_VOTE), touch_rd(gcc, rcg), cfg, dfs);
 +	if (dfs & 1u) {
 +		/* SE CLK_SEL=0 selects DFS performance level 0. Do not alter tables. */
-+		cfg = touch_rd(st.gcc, SURYA_RCG + 0x1cu);
++		cfg = touch_rd(gcc, rcg + 0x1cu);
 +		if ((cfg & 0x371fu) != 1u) {
-+			printf("SURYA TOUCH: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
++			printf("SURYA %s: DFS level0=%#x is not XO/1; need clock integration\n", who, cfg);
 +			return false;
 +		}
 +	} else {
 +		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
 +		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
-+		touch_wr(st.gcc, SURYA_RCG + 4u, cfg);
-+		touch_wr(st.gcc, SURYA_RCG, touch_rd(st.gcc, SURYA_RCG) | 1u);
-+		if (!touch_wait_clear(st.gcc, SURYA_RCG, 1u)) {
-+			printf("SURYA TOUCH: RCG update timeout\n");
++		touch_wr(gcc, rcg + 4u, cfg);
++		touch_wr(gcc, rcg, touch_rd(gcc, rcg) | 1u);
++		if (!touch_wait_clear(gcc, rcg, 1u)) {
++			printf("SURYA %s: RCG update timeout\n", who);
 +			return false;
 +		}
 +	}
-+	/* gcc-sdmmagpie.c halt registers: m_ahb, s_ahb, core, core_2x, S0. */
-+	const uint32_t branches[] = {0x17004, 0x17008, 0x1700c, 0x17014, 0x17030};
++	/* gcc-sdmmagpie.c halt registers: m_ahb, s_ahb, core, core_2x, the SE. */
++	const uint32_t branches[] = {0x17004, 0x17008, 0x1700c, 0x17014, se_branch};
 +	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
-+		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
-+			printf("SURYA TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
-+			    touch_rd(st.gcc, branches[i]));
++		if (!touch_wait_clear(gcc, branches[i], 1u << 31)) {
++			printf("SURYA %s: GCC branch %#x halted (%#x)\n", who, branches[i],
++			    touch_rd(gcc, branches[i]));
 +			return false;
 +		}
 +	}
 +	return true;
++}
++
++static bool
++surya_clocks(void)
++{
++	return surya_qup_clocks(st.gcc, SURYA_VOTE_MASK, SURYA_RCG, 0x17030, "TOUCH");
 +}
 +
 +static bool
@@ -950,6 +979,7 @@ writes the small state files in /private/var/db (time, backlight).
 +}
 +
 +static void surya_lights_off(void);
++static void surya_vib_off(void);
 +
 +static int
 +surya_halt_restart(unsigned int type)
@@ -958,6 +988,9 @@ writes the small state files in /private/var/db (time, backlight).
 +	if (type == kPEHaltCPU || type == kPEUPSDelayHaltCPU || type == kPERestartCPU ||
 +	    type == kPEPanicRestartCPU) {
 +		surya_lights_off(); /* PMIC blocks keep their state over a warm reset */
++		if (type != kPEPanicRestartCPU) {
++			surya_vib_off(); /* after a panic its thread may not run; reset stops it */
++		}
 +	}
 +	switch (type) {
 +	case kPEHaltCPU:
@@ -1562,6 +1595,682 @@ writes the small state files in /private/var/db (time, backlight).
 +	(void)surya_led_set(want);
 +}
 +
++/*
++ * Vibration: Awinic AW8624 on GENI SE1 in I2C mode (qupv3_se1_i2c, 0x884000),
++ * address 0x5a, 400 kHz (surya's DT gives no rate: i2c-qcom-geni's default).
++ * Facts from surya's dtbo (fragment 60) and Xiaomi surya-q-oss aw8624.c:
++ *  - SDA/SCL gpio0/1, function qup01, SOUTH tile, 2 mA, no pull; reset gpio63
++ *    (NORTH, low 5 ms then high); interrupt gpio26 (SOUTH, input, pull-up),
++ *    not used: status is polled.
++ *  - CONT mode (aw8624_haptic_cont): the chip drives the motor at its own
++ *    resonance from the back-EMF zero crossings, so no waveform file is needed
++ *    (Xiaomi's RAM waves, aw8624_haptic.bin, stay out of this tree). f0 preset
++ *    205.0 Hz; f0 calibrated once at start as aw8624_haptic_f0_calibration,
++ *    a short buzz while the chip measures the motor.
++ *  - Patterns come from iOS through SweetBattery's "vibrator" service
++ *    (FigVibrator_IOKit): pairs of intensity (16.16, 0 = off) and milliseconds,
++ *    played by one thread; intensity scales the CONT drive level.
++ * Boot-arg suryavib=0 leaves the chip alone.
++ */
++#define SURYA_VIB_SE_PA    0x00884000u
++#define SURYA_SOUTH_PA     0x03d00000u /* DT TLMM + SOUTH (0x900000) */
++#define SURYA_VIB_RCG      0x17164u    /* wrapper0 S1 */
++#define SURYA_VIB_VOTE     ((0x0fu << 6) | (1u << 11)) /* wrap0 m_ahb, s_ahb, core, core_2x, S1 */
++#define SURYA_VIB_ADDR     0x5au
++#define SURYA_VIB_RST_GPIO 63u
++#define SURYA_VIB_IRQ_GPIO 26u
++#define SURYA_VIB_MAX_SEG  64u
++#define SURYA_VIB_CAP_NS   120000000000ULL /* a pattern nobody stopped ends after 120 s */
++
++/* aw8624_reg.h */
++#define AW_ID           0x00
++#define AW_SYSINT       0x02
++#define AW_SYSINTM      0x03
++#define AW_SYSCTRL      0x04
++#define AW_GO           0x05
++#define AW_DATCTRL      0x2b
++#define AW_PWMPRC       0x2d
++#define AW_PWMDBG       0x2e
++#define AW_WAVECTRL     0x31
++#define AW_ANACTRL      0x38
++#define AW_SW_BRAKE     0x39
++#define AW_PRLVL        0x3e
++#define AW_GLB_STATE    0x47
++#define AW_CONT_CTRL    0x48
++#define AW_F_PRE_H      0x49
++#define AW_F_PRE_L      0x4a
++#define AW_TD_H         0x4b
++#define AW_TD_L         0x4c
++#define AW_TSET         0x4d
++#define AW_THRS_BRA_END 0x4f
++#define AW_EF_RDATAH    0x55
++#define AW_TRIM_LRA     0x5b
++#define AW_R_SPARE      0x5d
++#define AW_DETCTRL      0x5f
++#define AW_ADCTEST      0x66
++#define AW_F_LRA_F0_H   0x68
++#define AW_F_LRA_F0_L   0x69
++#define AW_WAIT_VOL_MP  0x6e
++#define AW_WAIT_VOL_MN  0x6f
++#define AW_ZC_THRSH_H   0x72
++#define AW_ZC_THRSH_L   0x73
++#define AW_BEMF_VTHH_H  0x74
++#define AW_BEMF_NUM     0x78
++#define AW_TIME_NZC     0x7a
++#define AW_DRV_LVL      0x7b
++#define AW_DRV_LVL_OV   0x7c
++#define AW_NUM_F0_1     0x7d
++#define AW_NUM_F0_2     0x7e
++#define AW_NUM_F0_3     0x7f
++
++/* surya dtbo haptic@5A */
++#define AW_V_F0_PRE     2050u   /* vib_f0_pre, 0.1 Hz */
++#define AW_V_F0_COEFF   260u    /* vib_f0_coeff */
++#define AW_V_CALI_PCT   7       /* vib_f0_cali_percen */
++#define AW_V_DRV_LVL    0x64u   /* vib_cont_drv_lev */
++#define AW_V_DRV_LVL_OV 0x69u   /* vib_cont_drv_lvl_ov */
++#define AW_V_TD         0xf06cu /* vib_cont_td */
++#define AW_V_ZC_THR     0x08f8u /* vib_cont_zc_thr */
++#define AW_V_NUM_BRK    0x03u   /* vib_cont_num_brk */
++#define AW_V_SW_BRAKE   0x2cu   /* vib_sw_brake */
++#define AW_V_TSET       0x11u   /* vib_tset */
++static const uint8_t aw_bemf[4] = {0x10, 0x08, 0x23, 0xf8};  /* vib_bemf_config */
++static const uint8_t aw_trace[4] = {0x09, 0x05, 0x01, 0x0f}; /* vib_f0_trace_parameter */
++
++static struct {
++	vm_offset_t se, gcc, north, south;
++	bool dead;
++	int chipid_flag;
++	uint8_t trim;
++	int level;          /* drive level now: 0 stopped, -1 unknown after an error */
++	unsigned retries, changes;
++	IOLock *lock;       /* guards the pattern below, written by surya_vib_play */
++	uint32_t seg[2 * SURYA_VIB_MAX_SEG];
++	unsigned nseg, gen;
++	bool repeat;
++} svib;
++static int svib_chan;
++
++static void
++surya_vib_abort(void)
++{
++	touch_wr(svib.se, SE_CTRL, 2); /* abort M command, release held bus */
++	bool done = false;
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (touch_rd(svib.se, SE_IRQ) & (1u << 5)) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done || !touch_wait_clear(svib.se, SE_STATUS, 1u)) {
++		svib.dead = true;
++		printf("SURYA VIB: abort failed status=%#x irq=%#x; stopping\n",
++		    touch_rd(svib.se, SE_STATUS), touch_rd(svib.se, SE_IRQ));
++	}
++	for (unsigned i = 0; i < 64 && (touch_rd(svib.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)touch_rd(svib.se, SE_RX);
++	}
++	touch_wr(svib.se, SE_IRQ_CLR, 0xffffffffu);
++	if (touch_rd(svib.se, SE_TX_COUNT) & 0xfffffffu) {
++		svib.dead = true;
++		printf("SURYA VIB: TX FIFO not empty after abort; stopping\n");
++	}
++}
++
++/* One FIFO message on SE1, as touch_msg_run: TX of at most 3 bytes, or RX of at most 4. */
++static int
++surya_vib_msg(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	unsigned sent = 0, got = 0;
++	if (svib.dead || nt > 3 || nr > 4 || (nt && nr) || (!nt && !nr)) {
++		return EIO;
++	}
++	if (!touch_wait_clear(svib.se, SE_STATUS, 1u)) {
++		svib.dead = true; /* no other SE1 owner is supported */
++		return EBUSY;
++	}
++	touch_wr(svib.se, SE_IRQ_CLR, 0xffffffffu);
++	touch_wr(svib.se, SE_TX_WM, nt ? 1u : 0u);
++	touch_wr(svib.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	touch_wr(svib.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
++	    ((uint32_t)SURYA_VIB_ADDR << 9) | (stretch ? 4u : 0u));
++	int err = ETIMEDOUT;
++	for (unsigned i = 0; i < 20000; ++i) {
++		uint32_t irq = touch_rd(svib.se, SE_IRQ);
++		if (irq & SE_ERRORS) {
++			err = (irq & SE_NACK) ? ENXIO : EIO;
++			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
++				delay(1);
++				irq = touch_rd(svib.se, SE_IRQ);
++			}
++			if ((irq & SE_DONE) && !(touch_rd(svib.se, SE_STATUS) & 1u) &&
++			    !(touch_rd(svib.se, SE_TX_COUNT) & 0xfffffffu) &&
++			    !(touch_rd(svib.se, SE_RX_COUNT) & 0x1ffffffu)) {
++				touch_wr(svib.se, SE_IRQ_CLR, irq);
++				return err;
++			}
++			break;
++		}
++		if (nt && !sent && (irq & SE_TX_WM_IRQ)) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < nt; ++j) {
++				word |= (uint32_t)tx[j] << (8u * j);
++			}
++			touch_wr(svib.se, SE_TX, word);
++			sent = nt;
++			touch_wr(svib.se, SE_TX_WM, 0);
++		}
++		uint32_t count = touch_rd(svib.se, SE_RX_COUNT) & 0x1ffffffu;
++		if (count > (nr - got + 3u) / 4u) {
++			err = EIO;
++			break;
++		}
++		while (count--) {
++			uint32_t word = touch_rd(svib.se, SE_RX);
++			for (unsigned j = 0; j < 4 && got < nr; ++j) {
++				rx[got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		if (irq & SE_DONE) {
++			irq = touch_rd(svib.se, SE_IRQ);
++			if (irq & SE_ERRORS) {
++				continue;
++			}
++			touch_wr(svib.se, SE_IRQ_CLR, irq);
++			if (got == nr && sent == nt) {
++				return 0;
++			}
++			err = EIO;
++			break;
++		}
++		touch_wr(svib.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		delay(1);
++	}
++	surya_vib_abort();
++	return err;
++}
++
++/* aw8624_i2c_write / _read, which also retry a failed transfer. */
++static int
++aw_wr(uint8_t reg, uint8_t val)
++{
++	const uint8_t buf[2] = {reg, val};
++	int err = EIO;
++	for (unsigned i = 0; i < 3 && err && !svib.dead; ++i) {
++		svib.retries += i ? 1u : 0u;
++		err = surya_vib_msg(buf, 2, NULL, 0, false);
++	}
++	return err;
++}
++
++static int
++aw_rd(uint8_t reg, uint8_t *val)
++{
++	int err = EIO;
++	for (unsigned i = 0; i < 3 && err && !svib.dead; ++i) {
++		svib.retries += i ? 1u : 0u;
++		/* STOP_STRETCH on the pointer write keeps the bus for a repeated START. */
++		err = surya_vib_msg(&reg, 1, NULL, 0, true);
++		if (!err) {
++			err = surya_vib_msg(NULL, 0, val, 1, false);
++		}
++	}
++	return err;
++}
++
++/* aw8624_i2c_write_bits, with the bits to clear named positively. */
++static int
++aw_bits(uint8_t reg, uint8_t clear, uint8_t set)
++{
++	uint8_t v = 0;
++	int err = aw_rd(reg, &v);
++	return err ? err : aw_wr(reg, (uint8_t)((v & ~clear) | set));
++}
++
++/* aw8624_haptic_play_mode(STANDBY): UVLO interrupt off, standby. */
++static int
++aw_standby(void)
++{
++	int err = aw_bits(AW_SYSINTM, 0x20, 0x20);
++	return err | aw_bits(AW_SYSCTRL, 0x01, 0x01);
++}
++
++/* aw8624_haptic_play_mode(CONT) with aw8624_haptic_active. */
++static int
++aw_cont_mode(void)
++{
++	uint8_t v = 0;
++	int err = aw_bits(AW_SYSCTRL, 0x0c, 0x08); /* play mode CONT */
++	err |= aw_bits(AW_SYSCTRL, 0x01, 0x00);    /* active */
++	err |= aw_rd(AW_SYSINT, &v);               /* interrupt_clear: reading clears */
++	err |= aw_bits(AW_SYSINTM, 0x20, 0x00);    /* UVLO interrupt on */
++	return err;
++}
++
++/* aw8624_haptic_stop: GO off once, wait for GLB_STATE 0, then standby. */
++static int
++aw_stop(void)
++{
++	bool go_off = false;
++	uint8_t s = 0xff;
++	for (unsigned i = 0; i < 60; ++i) {
++		int err = aw_rd(AW_GLB_STATE, &s);
++		if (err) {
++			return err;
++		}
++		if (s == 0) {
++			return aw_standby();
++		}
++		if (s > 3 && !go_off) { /* 1..3: bringing up; above: playing */
++			go_off = true;
++			if ((err = aw_bits(AW_GO, 0x01, 0x00))) {
++				return err;
++			}
++		}
++		touch_wait(2);
++	}
++	printf("SURYA VIB: no standby after 120 ms (state %#x)\n", s);
++	return aw_standby();
++}
++
++static int
++aw_f0_preset(void)
++{
++	unsigned f0_reg = 1000000000u / (AW_V_F0_PRE * AW_V_F0_COEFF);
++	int err = aw_wr(AW_F_PRE_H, (uint8_t)(f0_reg >> 8));
++	return err | aw_wr(AW_F_PRE_L, (uint8_t)f0_reg);
++}
++
++/* aw8624_haptic_cont at drive level `level` (the work routine first loads the
++ * calibrated trim and stops whatever plays). */
++static int
++aw_cont_start(unsigned level)
++{
++	int err = aw_wr(AW_TRIM_LRA, svib.trim);
++	err |= aw_stop();
++	err |= aw_cont_mode();
++	err |= aw_f0_preset();
++	err |= aw_bits(AW_DATCTRL, 0xe0, 0xe0); /* LPF 1000 Hz (bits 7:6), LPF on */
++	/* zero cross detect, wait 1 period, run while GO, closed loop, no f0
++	 * detect, no O2C, auto brake */
++	err |= aw_wr(AW_CONT_CTRL, 0x89);
++	err |= aw_wr(AW_TD_H, (uint8_t)(AW_V_TD >> 8));
++	err |= aw_wr(AW_TD_L, (uint8_t)AW_V_TD);
++	err |= aw_wr(AW_TSET, AW_V_TSET);
++	err |= aw_wr(AW_ZC_THRSH_H, (uint8_t)(AW_V_ZC_THR >> 8));
++	err |= aw_wr(AW_ZC_THRSH_L, (uint8_t)AW_V_ZC_THR);
++	err |= aw_bits(AW_BEMF_NUM, 0x0f, AW_V_NUM_BRK);
++	err |= aw_wr(AW_TIME_NZC, 0x23); /* 35 * 171 us */
++	err |= aw_wr(AW_DRV_LVL, (uint8_t)level);
++	err |= aw_wr(AW_DRV_LVL_OV, AW_V_DRV_LVL_OV);
++	err |= aw_bits(AW_GO, 0x01, 0x01);
++	return err;
++}
++
++/* aw8624_haptic_get_f0: one open-loop trace, f0 in 0.1 Hz. */
++static int
++aw_get_f0(unsigned *f0)
++{
++	int err = aw_stop();
++	err |= aw_cont_mode();
++	err |= aw_bits(AW_CONT_CTRL, 0x08, 0x00); /* open playback */
++	err |= aw_bits(AW_CONT_CTRL, 0x04, 0x04); /* f0 detect */
++	err |= aw_bits(AW_DATCTRL, 0xe0, 0xe0);
++	err |= aw_bits(AW_ANACTRL, 0x20, 0x20);   /* LRA clock from TRIM_LRA (CALI_F0) */
++	err |= aw_f0_preset();
++	err |= aw_wr(AW_DRV_LVL, AW_V_DRV_LVL);
++	err |= aw_wr(AW_NUM_F0_1, (uint8_t)((aw_trace[0] << 4) | aw_trace[1]));
++	err |= aw_wr(AW_NUM_F0_2, aw_trace[2]);
++	err |= aw_wr(AW_NUM_F0_3, aw_trace[3]);
++	uint8_t v = 0, h = 0, l = 0, mp = 0, mn = 0;
++	err |= aw_rd(AW_SYSINT, &v);
++	err |= aw_bits(AW_GO, 0x01, 0x01);
++	if (err) {
++		return err;
++	}
++	unsigned t_f0_ms = 1000u * 10u / AW_V_F0_PRE;
++	touch_wait(t_f0_ms * (aw_trace[0] + aw_trace[1] +
++	    (aw_trace[3] + aw_trace[1]) * aw_trace[2]) + 10u);
++	err = ETIMEDOUT;
++	for (unsigned i = 0; i < 50; ++i) {
++		if (aw_rd(AW_GLB_STATE, &v)) {
++			err = EIO;
++			break;
++		}
++		if ((v & 0x0f) == 0) {
++			err = aw_rd(AW_F_LRA_F0_H, &h);
++			err |= aw_rd(AW_F_LRA_F0_L, &l);
++			(void)aw_rd(AW_WAIT_VOL_MP, &mp);
++			(void)aw_rd(AW_WAIT_VOL_MN, &mn);
++			unsigned reg = ((unsigned)h << 8) | l;
++			/* Xiaomi keeps the preset when the chip reports 0. */
++			*f0 = reg ? 1000000000u / (reg * AW_V_F0_COEFF) : AW_V_F0_PRE;
++			printf("SURYA VIB: f0 reg %#x -> %u.%u Hz, bemf max +%u -%u\n",
++			    reg, *f0 / 10u, *f0 % 10u, mp, mn);
++			break;
++		}
++		touch_wait(10);
++	}
++	(void)aw_bits(AW_CONT_CTRL, 0x08, 0x08); /* closed playback */
++	(void)aw_bits(AW_CONT_CTRL, 0x04, 0x00); /* f0 detect off */
++	return err;
++}
++
++/* aw8624_haptic_f0_calibration: TRIM_LRA from the measured f0. */
++static void
++aw_f0_calibrate(void)
++{
++	svib.trim = 0;
++	(void)aw_wr(AW_TRIM_LRA, 0);
++	unsigned f0 = AW_V_F0_PRE;
++	int err = aw_get_f0(&f0);
++	if (err) {
++		printf("SURYA VIB: f0 measurement failed %d, trim 0\n", err);
++	} else {
++		int pre = (int)AW_V_F0_PRE, lim = (int)f0;
++		if (f0 * 100u < AW_V_F0_PRE * (100u - AW_V_CALI_PCT) ||
++		    f0 * 100u > AW_V_F0_PRE * (100u + AW_V_CALI_PCT)) {
++			lim = pre;
++		}
++		int base = svib.chipid_flag == 1 ? 32 : 16;
++		int step = 100000 * (lim - pre) / (lim * 25);
++		if (step >= 0) {
++			step = base + step / 10 + (step % 10 >= 5 ? 1 : 0);
++		} else {
++			step = base + step / 10 - (step % 10 <= -5 ? 1 : 0);
++		}
++		int lra;
++		if (svib.chipid_flag == 1) {
++			lra = step > 31 ? step - 32 : step + 32;
++		} else {
++			lra = (step < 16 || (step > 31 && step < 48)) ? step + 16 : step - 16;
++		}
++		svib.trim = (uint8_t)lra;
++		uint8_t back = 0xee;
++		(void)aw_wr(AW_TRIM_LRA, svib.trim);
++		(void)aw_rd(AW_TRIM_LRA, &back);
++		printf("SURYA VIB: f0 %u.%u Hz (limit %d), step %d, trim %#x read back %#x\n",
++		    f0 / 10u, f0 % 10u, lim, step, svib.trim, back);
++	}
++	(void)aw_standby();
++	(void)aw_stop();
++}
++
++static bool
++surya_vib_se_init(void)
++{
++	vm_offset_t se = svib.se;
++	uint32_t fw = touch_rd(se, SE_FW);
++	uint32_t tx = touch_rd(se, SE_HW_TX), rx = touch_rd(se, SE_HW_RX);
++	printf("SURYA VIB: se1 fw=%#x proto=%u status=%#x tx=%#x rx=%#x\n",
++	    fw, (fw >> 8) & 0xffu, touch_rd(se, SE_STATUS), tx, rx);
++	/* Protocol 3 = I2C (qcom-geni-se.h); SE firmware comes from qupfw. */
++	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(se, 0x64) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
++	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
++		printf("SURYA VIB: need I2C firmware on SE1 and 32-bit FIFOs; stopping\n");
++		return false;
++	}
++	if (touch_rd(se, SE_STATUS) & 0x1001u) {
++		printf("SURYA VIB: SE1 already busy; stopping\n");
++		return false;
++	}
++	touch_wr(se, 0xe18, 0); /* no GSI events */
++	touch_wr(se, 0xe1c, 0); /* mask external IRQ routing; poll local status */
++	touch_wr(se, 0x644, 0);
++	touch_wr(se, SE_IRQ_CLR, 0xffffffffu);
++	touch_wr(se, 0x648, 0xffffffffu);
++	touch_wr(se, SE_DMA, 0);
++	touch_wr(se, 0x28, touch_rd(se, 0x28) | 0x7fu);
++	touch_wr(se, 0xe30, touch_rd(se, 0xe30) | 0x0fu);
++	touch_wr(se, 0x24, 0x7f);
++	touch_wr(se, 0x20, 1);
++	touch_wr(se, SE_CLK_SEL, 0);
++	/* i2c-qcom-geni.c geni_i2c_clk_map, 400 kHz: divider 2, t_high 5, t_low 12, cycle 24. */
++	touch_wr(se, SE_MCLK, (2u << 4) | 1u);
++	touch_wr(se, SE_SCL, (5u << 20) | (12u << 10) | 24u);
++	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
++	touch_wr(se, 0x254, 0);
++	touch_wr(se, 0x260, SE_PACK0);
++	touch_wr(se, 0x264, SE_PACK1);
++	touch_wr(se, 0x284, SE_PACK0);
++	touch_wr(se, 0x288, SE_PACK1);
++	touch_wr(se, SE_TX_WM, 0);
++	touch_wr(se, 0x810, 0);
++	touch_wr(se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
++	touch_wr(se, SE_IRQ_EN, SE_EVENTS);
++	if (touch_rd(se, 0x260) != SE_PACK0 || touch_rd(se, 0x264) != SE_PACK1 ||
++	    touch_rd(se, 0x284) != SE_PACK0 || touch_rd(se, 0x288) != SE_PACK1 ||
++	    touch_rd(se, 0x254) != 0) {
++		printf("SURYA VIB: packing readback mismatch; stopping\n");
++		return false;
++	}
++	if ((touch_rd(se, SE_TX_COUNT) & 0xfffffffu) || (touch_rd(se, SE_RX_COUNT) & 0x1ffffffu)) {
++		printf("SURYA VIB: inherited FIFO data; stopping\n");
++		return false;
++	}
++	return true;
++}
++
++/* Bus, reset, chip id 0x24, then aw8624_haptic_init with its f0 calibration. */
++static bool
++surya_vib_init(void)
++{
++	svib.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
++	svib.north = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
++	svib.south = ml_io_map(SURYA_SOUTH_PA, 0x1b000);
++	svib.se = ml_io_map(SURYA_VIB_SE_PA, 0x4000);
++	if (!svib.gcc || !svib.north || !svib.south || !svib.se) {
++		printf("SURYA VIB: MMIO mapping failed\n");
++		return false;
++	}
++	printf("SURYA VIB: before: sda cfg=%#x scl cfg=%#x rst cfg=%#x io=%#x irq cfg=%#x io=%#x\n",
++	    touch_rd(svib.south, TOUCH_GPIO_CFG(0)), touch_rd(svib.south, TOUCH_GPIO_CFG(1)),
++	    touch_rd(svib.north, TOUCH_GPIO_CFG(SURYA_VIB_RST_GPIO)),
++	    touch_rd(svib.north, TOUCH_GPIO_IO(SURYA_VIB_RST_GPIO)),
++	    touch_rd(svib.south, TOUCH_GPIO_CFG(SURYA_VIB_IRQ_GPIO)),
++	    touch_rd(svib.south, TOUCH_GPIO_IO(SURYA_VIB_IRQ_GPIO)));
++	if (!surya_qup_clocks(svib.gcc, SURYA_VIB_VOTE, SURYA_VIB_RCG, 0x17160, "VIB") ||
++	    !surya_vib_se_init()) {
++		return false;
++	}
++	surya_pin(svib.south, 0, 1, 0, 0, false, false); /* qup01 SDA, no pull, 2 mA */
++	surya_pin(svib.south, 1, 1, 0, 0, false, false); /* qup01 SCL */
++	surya_pin(svib.south, SURYA_VIB_IRQ_GPIO, 0, 3, 0, false, false); /* input, pull-up */
++	uint8_t id = 0;
++	int err = EIO;
++	for (unsigned retry = 0; retry < 3 && !svib.dead; ++retry) {
++		/* aw8624_hw_reset: low 5 ms, high 5 ms (msm_gpio_63: gpio, 2 mA, no pull) */
++		surya_pin(svib.north, SURYA_VIB_RST_GPIO, 0, 0, 0, true, false);
++		touch_wait(5);
++		surya_pin(svib.north, SURYA_VIB_RST_GPIO, 0, 0, 0, true, true);
++		touch_wait(5);
++		err = aw_rd(AW_ID, &id);
++		printf("SURYA VIB: chip id try %u err=%d id=%#x\n", retry, err, id);
++		if (!err && id == 0x24) {
++			break;
++		}
++		touch_wait(10);
++	}
++	if (err || id != 0x24) {
++		printf("SURYA VIB: no AW8624; stopping\n");
++		return false;
++	}
++	(void)aw_wr(AW_ID, 0xaa); /* soft reset */
++	touch_wait(2);
++	uint8_t ef = 0;
++	svib.chipid_flag = !aw_rd(AW_EF_RDATAH, &ef) && (ef & 1u);
++	err = aw_standby();
++	err |= aw_bits(AW_PWMDBG, 0x60, 0x40);  /* PWM 24 kHz */
++	err |= aw_bits(AW_DETCTRL, 0x20, 0x20); /* motor protection: no action */
++	err |= aw_bits(AW_PWMPRC, 0x80, 0x00);
++	err |= aw_bits(AW_PRLVL, 0x80, 0x00);
++	err |= aw_bits(AW_ADCTEST, 0x40, 0x40); /* CONT battery compensation in hardware */
++	err |= aw_bits(AW_R_SPARE, 0x80, 0x80);
++	if (err) {
++		printf("SURYA VIB: init writes failed %d; stopping\n", err);
++		return false;
++	}
++	aw_f0_calibrate();
++	err = aw_wr(AW_SW_BRAKE, AW_V_SW_BRAKE);
++	err |= aw_wr(AW_THRS_BRA_END, 0x00);
++	err |= aw_bits(AW_WAVECTRL, 0xf0, 0x00);
++	err |= aw_wr(AW_ZC_THRSH_H, (uint8_t)(AW_V_ZC_THR >> 8));
++	err |= aw_wr(AW_ZC_THRSH_L, (uint8_t)AW_V_ZC_THR);
++	err |= aw_wr(AW_TSET, AW_V_TSET);
++	for (unsigned i = 0; i < 4; ++i) {
++		err |= aw_wr((uint8_t)(AW_BEMF_VTHH_H + i), aw_bemf[i]);
++	}
++	printf("SURYA VIB: AW8624 ready (efuse flag %d, trim %#x, retries %u)%s\n",
++	    svib.chipid_flag, svib.trim, svib.retries, err ? " with write errors" : "");
++	return !svib.dead;
++}
++
++/* Intensity (16.16, 1.0 = 0x10000) to the CONT drive level; 0 stops. */
++static void
++surya_vib_drive(uint32_t intensity)
++{
++	unsigned level = 0;
++	if (intensity) {
++		uint64_t l = ((uint64_t)AW_V_DRV_LVL * (intensity > 0x10000u ? 0x10000u : intensity) +
++		    0x8000u) >> 16;
++		level = l ? (unsigned)l : 1u;
++	}
++	if ((int)level == svib.level) {
++		return;
++	}
++	int err;
++	if (!level) {
++		err = aw_stop();
++	} else if (svib.level > 0) {
++		err = aw_wr(AW_DRV_LVL, (uint8_t)level); /* already playing: new level only */
++	} else {
++		err = aw_cont_start(level);
++	}
++	if (svib.changes < 200) {
++		++svib.changes;
++		printf("SURYA VIB: level %d -> %u%s\n", svib.level, level, err ? " FAILED" : "");
++	}
++	svib.level = err ? -1 : (int)level;
++}
++
++/* Sleep up to ms, or less if a new pattern arrives (thread_wakeup on svib_chan). */
++static void
++surya_vib_wait(unsigned ms, unsigned gen)
++{
++	if (ms) {
++		uint64_t deadline;
++		clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&svib_chan, THREAD_UNINT, deadline);
++	} else {
++		(void)assert_wait(&svib_chan, THREAD_UNINT);
++	}
++	IOLockLock(svib.lock);
++	bool fresh = svib.gen != gen;
++	IOLockUnlock(svib.lock);
++	if (fresh) {
++		(void)clear_wait(current_thread(), THREAD_AWAKENED);
++	} else {
++		(void)thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++static void
++surya_vib_loop(void)
++{
++	uint32_t seg[2 * SURYA_VIB_MAX_SEG];
++	unsigned n = 0, i = 0, gen = 0;
++	bool repeat = false;
++	uint64_t started = 0;
++	for (;;) {
++		IOLockLock(svib.lock);
++		if (svib.gen != gen) {
++			gen = svib.gen;
++			n = svib.nseg;
++			repeat = svib.repeat;
++			bcopy(svib.seg, seg, sizeof(seg[0]) * 2u * n);
++			i = 0;
++			started = surya_now_ns();
++		}
++		IOLockUnlock(svib.lock);
++		if (i < n && surya_now_ns() - started > SURYA_VIB_CAP_NS) {
++			printf("SURYA VIB: pattern still running after 120 s; stopped\n");
++			n = 0;
++		}
++		if (i >= n) {
++			surya_vib_drive(0);
++			surya_vib_wait(0, gen); /* until the next pattern */
++			continue;
++		}
++		surya_vib_drive(seg[2u * i]);
++		unsigned ms = seg[2u * i + 1u];
++		if (++i >= n && repeat) {
++			i = 0;
++		}
++		surya_vib_wait(ms, gen);
++	}
++}
++
++/*
++ * From SweetBattery's "vibrator" service: n pairs of intensity (16.16, 0 =
++ * off) and milliseconds replace whatever plays; n = 0 stops. Never blocks.
++ * Returns -1 when there is no usable chip.
++ */
++int surya_vib_play(const uint32_t *pairs, unsigned n, int repeat);
++
++int
++surya_vib_play(const uint32_t *pairs, unsigned n, int repeat)
++{
++	if (!svib.lock || svib.dead) {
++		return -1;
++	}
++	if (n > SURYA_VIB_MAX_SEG) {
++		printf("SURYA VIB: pattern of %u pairs cut to %u\n", n, SURYA_VIB_MAX_SEG);
++		n = SURYA_VIB_MAX_SEG;
++	}
++	IOLockLock(svib.lock);
++	for (unsigned i = 0; i < n; ++i) {
++		svib.seg[2u * i] = pairs[2u * i];
++		svib.seg[2u * i + 1u] = pairs[2u * i + 1u] ? pairs[2u * i + 1u] : 1u;
++	}
++	svib.nseg = n;
++	svib.repeat = repeat && n;
++	++svib.gen;
++	IOLockUnlock(svib.lock);
++	thread_wakeup(&svib_chan);
++	return 0;
++}
++
++static void
++surya_vib_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	/* sweet_touch_init runs right before sweet_usb_probe: let the USB log come
++	 * up first, so a bus problem here is seen. Still well before mediaserverd;
++	 * a pattern sent earlier waits for the chip. */
++	touch_wait(3000);
++	if (surya_vib_init()) {
++		surya_vib_loop();
++	}
++	svib.dead = true;
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Power off and restart: ask the player to stop and give it 300 ms. */
++static void
++surya_vib_off(void)
++{
++	if (svib.dead || svib.level == 0 || surya_vib_play(NULL, 0, 0)) {
++		return;
++	}
++	for (unsigned i = 0; i < 300 && svib.level != 0; ++i) {
++		delay(1000);
++	}
++}
++
 +static void
 +surya_lights_off(void)
 +{
@@ -1580,7 +2289,7 @@ writes the small state files in /private/var/db (time, backlight).
  void
  sweet_touch_init(void)
  {
-@@ -644,13 +2178,16 @@
+@@ -644,17 +2876,35 @@
  		return;
  	}
  	st.started = true;
@@ -1593,8 +2302,27 @@ writes the small state files in /private/var/db (time, backlight).
  	}
 -	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
 +	/* sweettouch=2: surya's Novatek SPI driver instead of the sweet probes. */
++	if (enabled == 2) {
++		surya_gcc_lock = IOLockAlloc();
++	}
 +	kern_return_t kr = kernel_thread_start(enabled == 2 ? surya_touch_thread : touch_thread,
 +	    NULL, &thread);
  	if (kr == KERN_SUCCESS) {
  		thread_deallocate(thread);
  	} else {
+ 		printf("SWEET TOUCH: kernel_thread_start failed %d\n", kr);
+ 	}
++	/* surya's vibration motor, unless suryavib=0. */
++	int vib = 1;
++	(void)PE_parse_boot_argn("suryavib", &vib, sizeof(vib));
++	if (enabled == 2 && vib && surya_gcc_lock && (svib.lock = IOLockAlloc())) {
++		kr = kernel_thread_start(surya_vib_thread, NULL, &thread);
++		if (kr == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			svib.dead = true;
++			printf("SURYA VIB: kernel_thread_start failed %d\n", kr);
++		}
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

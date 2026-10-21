@@ -23,6 +23,13 @@ Brightness across reboots: the last non-zero brightness iOS set is saved in
 it is applied (unless iOS set one first) and published as the IODisplayParameters
 "value" iOS fades from, instead of a fixed 512. The 1 s timer also drives the
 notification LED (0900) with the last published charger state.
+
+The "vibrator" service (SuryaVibrator, 22.10): iOS's FigVibrator falls back to
+an IOKit vibrator found with IOServiceNameMatching("vibrator") and drives it
+with IORegistryEntrySetCFProperties: {hertz_millisecs: [state, ms, ...],
+repeat}, a state being {intensity: 16.16} or false, and a bare number 0 to
+stop. setProperties logs what arrives and hands the pairs to surya_vib_play()
+(0900).
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
 @@ -3,6 +3,15 @@
@@ -84,7 +91,7 @@ notification LED (0900) with the last published charger state.
  
  class SweetBattery : public IOPMPowerSource {
  	OSDeclareDefaultStructors(SweetBattery);
-@@ -28,14 +69,42 @@
+@@ -28,14 +69,43 @@
  	IOTimerEventSource *fTimer;
  	bool fTimerAdded, fRunning, fReal;
  	int fLastMode;
@@ -107,6 +114,7 @@ notification LED (0900) with the last published charger state.
 +	bool fLedExt, fLedChg;
 +	unsigned fLedPct;
 +	OSObject *fBacklight; /* AppleARMBacklight, for its 1 s tick */
++	OSObject *fVibrator;  /* SuryaVibrator, the "vibrator" service */
 +	void suryaChargerLog(void);
  	void putNumber(const char *key, UInt32 value);
  	void putBool(const char *key, bool value);
@@ -127,7 +135,7 @@ notification LED (0900) with the last published charger state.
  	static unsigned estimatePercent(unsigned mv);
  };
  OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
-@@ -72,6 +141,20 @@
+@@ -72,6 +142,20 @@
  		}
  	}
  	fLastMode = -1;
@@ -148,7 +156,7 @@ notification LED (0900) with the last published charger state.
  	return true;
  }
  
-@@ -101,11 +184,11 @@
+@@ -101,11 +185,11 @@
  SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
      bool capable, bool charging, bool full, bool measured, bool currentValid)
  {
@@ -163,7 +171,7 @@ notification LED (0900) with the last published charger state.
  	setExternalConnected(external);
  	setExternalChargeCapable(capable);
  	setIsCharging(charging);
-@@ -119,8 +202,8 @@
+@@ -119,8 +203,8 @@
  	putBool("FullyCharged", full);
  	putBool("AppleRawExternalConnected", external);
  	putNumber("AppleRawCurrentCapacity", capacity);
@@ -174,7 +182,7 @@ notification LED (0900) with the last published charger state.
  	putNumber("InstantAmperage", (UInt32)ma);
  	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
  	putNumber("Temperature", 2500);
-@@ -137,7 +220,7 @@
+@@ -137,7 +221,7 @@
  		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
  		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
  		    kIOBatteryFlagsKey};
@@ -183,7 +191,7 @@ notification LED (0900) with the last published charger state.
  		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
  		    (charging ? kIOBatteryCharge : 0))};
  		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
-@@ -246,41 +329,669 @@
+@@ -246,41 +330,769 @@
  	    charging, full, true, currentValid);
  }
  
@@ -797,6 +805,93 @@ notification LED (0900) with the last published charger state.
 +	return kIOReturnUnsupported;
 +}
 +
++/*
++ * surya vibrator: the IOKit vibrator iOS's FigVibrator uses when there is no
++ * "Actuator" audio device (MediaExperience FigVibrator_IOKit.c, read 21.10).
++ * It finds the service with IOServiceNameMatching("vibrator") and calls
++ * IORegistryEntrySetCFProperties with
++ *   {hertz_millisecs: [state, ms, state, ms, ...], repeat: bool},
++ * a state being {intensity: SInt32 16.16} (on) or false (off); a CFNumber 0
++ * instead of the dictionary stops it. On an iPhone this is an
++ * AppleARMPWMDevice, the only class mediaserverd's sandbox lets it set these
++ * keys on; this kernel's sandbox policy is permissive. The motor itself is
++ * the AW8624 in bsd/dev/sweet_touch.c (surya_vib_play).
++ */
++#define SURYA_VIB_MAX_PAIRS 64u
++
++extern "C" int surya_vib_play(const uint32_t *pairs, unsigned n, int repeat);
++
++class SuryaVibrator : public IOService {
++	OSDeclareDefaultStructors(SuryaVibrator);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++private:
++	unsigned fLines;
++};
++OSDefineMetaClassAndStructors(SuryaVibrator, IOService);
++
++bool
++SuryaVibrator::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	fLines = 0;
++	setName("vibrator");
++	registerService();
++	IOLog("SURYA VIB: \"vibrator\" service registered\n");
++	return true;
++}
++
++IOReturn
++SuryaVibrator::setProperties(OSObject *properties)
++{
++	if (fLines < 300) {
++		++fLines;
++		OSSerialize *s = OSSerialize::withCapacity(512);
++		if (s && properties && properties->serialize(s)) {
++			IOLog("SURYA VIB: setProperties %.900s\n", s->text());
++		} else {
++			IOLog("SURYA VIB: setProperties (not serializable)\n");
++		}
++		OSSafeReleaseNULL(s);
++	}
++	if (OSDynamicCast(OSNumber, properties)) {
++		return surya_vib_play(NULL, 0, 0) ? kIOReturnNotReady : kIOReturnSuccess;
++	}
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	OSArray *hm = dict ? OSDynamicCast(OSArray, dict->getObject("hertz_millisecs")) : NULL;
++	if (!hm) {
++		return kIOReturnBadArgument;
++	}
++	OSBoolean *repeat = OSDynamicCast(OSBoolean, dict->getObject("repeat"));
++	uint32_t pairs[2 * SURYA_VIB_MAX_PAIRS];
++	unsigned n = 0;
++	for (unsigned i = 0; i + 1 < hm->getCount() && n < SURYA_VIB_MAX_PAIRS; i += 2, ++n) {
++		OSObject *state = hm->getObject(i);
++		OSNumber *ms = OSDynamicCast(OSNumber, hm->getObject(i + 1));
++		uint32_t intensity = 0;
++		if (OSDictionary *d = OSDynamicCast(OSDictionary, state)) {
++			OSNumber *in = OSDynamicCast(OSNumber, d->getObject("intensity"));
++			int32_t v = in ? (int32_t)in->unsigned32BitValue() : 0x10000;
++			intensity = v > 0 ? (uint32_t)v : 0;
++		} else if (OSBoolean *b = OSDynamicCast(OSBoolean, state)) {
++			intensity = b->isTrue() ? 0x10000u : 0;
++		} else if (OSNumber *v = OSDynamicCast(OSNumber, state)) {
++			intensity = v->unsigned32BitValue(); /* not seen from iOS; read as 16.16 */
++		}
++		pairs[2 * n] = intensity;
++		pairs[2 * n + 1] = ms ? ms->unsigned32BitValue() : 0;
++	}
++	if (hm->getCount() > 2 * SURYA_VIB_MAX_PAIRS) {
++		IOLog("SURYA VIB: pattern of %u entries cut to %u pairs\n", hm->getCount(),
++		    SURYA_VIB_MAX_PAIRS);
++	}
++	return surya_vib_play(pairs, n, repeat && repeat->isTrue()) ?
++	       kIOReturnNotReady : kIOReturnSuccess;
++}
++
  bool
  SweetBattery::start(IOService *provider)
  {
@@ -853,14 +948,28 @@ notification LED (0900) with the last published charger state.
 +		}
 +		OSSafeReleaseNULL(bl);
 +	}
++	/* surya: the "vibrator" service iOS looks up by name. */
++	if (fSurya) {
++		SuryaVibrator *vib = OSTypeAlloc(SuryaVibrator);
++		if (vib && vib->init() && vib->attach(this)) {
++			if (vib->start(this)) {
++				vib->retain();
++				fVibrator = vib;
++			} else {
++				vib->detach(this);
++			}
++		}
++		OSSafeReleaseNULL(vib);
++	}
  	return true;
  }
  
-@@ -314,6 +1025,7 @@
+@@ -314,6 +1126,8 @@
  {
  	OSSafeReleaseNULL(fTimer);
  	OSSafeReleaseNULL(fLoop);
 +	OSSafeReleaseNULL(fBacklight);
++	OSSafeReleaseNULL(fVibrator);
  	IOPMPowerSource::free();
  }
  #endif /* ARM64_BOARD_CONFIG_SWEET */
