@@ -37,7 +37,7 @@ shared with the touch (surya_qup_clocks, one lock for the GCC vote register).
 suryavib=0 leaves the chip alone.
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -14,12 +14,27 @@
+@@ -14,12 +14,30 @@
  #include <kern/sched_prim.h>
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
@@ -47,6 +47,9 @@ suryavib=0 leaves the chip alone.
 +#include <sys/uio.h>
 +#include <sys/vnode.h>
 +#include <sys/proc.h>
++#include <sys/proc_internal.h> /* p_fd, for the vibration timer probe */
++#include <sys/filedesc.h>
++#include <sys/event.h>
 +#include <IOKit/IOLocks.h>
 +#include "sweet_spmi.h"
 +
@@ -65,7 +68,7 @@ suryavib=0 leaves the chip alone.
  void sweet_touch_init(void);
  
  #define TOUCH_SE_PA      0x00a84000u
-@@ -635,6 +650,2252 @@
+@@ -635,6 +653,2292 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -1697,6 +1700,45 @@ suryavib=0 leaves the chip alone.
 +extern task_t proc_task(proc_t);
 +extern void sweet_sample_task(const char *name, int pid, task_t task); /* osfmk/kern/exception.c */
 +
++/*
++ * 22.10 probe: iOS's 1 s vibration stop timer never fired. Every EVFILT_TIMER
++ * knote of the sender (bsd/kern/kern_event.c: non-fd knotes hang off
++ * p_fd.fd_knhash; kn_ext[0] is the next deadline, kn_ext[1] the leeway, in
++ * the clock NOTE_MACH_CONTINUOUS_TIME selects), against the kernel's clocks.
++ */
++extern uint64_t mach_continuous_time(void);
++
++static void
++surya_vib_dump_timers(proc_t p)
++{
++	struct filedesc *fdp = &p->p_fd;
++	uint64_t now = mach_absolute_time(), cont = mach_continuous_time();
++	unsigned shown = 0, total = 0;
++	lck_mtx_lock(&fdp->fd_knhashlock);
++	for (u_long b = 0; fdp->fd_knhash && b <= fdp->fd_knhashmask; ++b) {
++		struct knote *kn;
++		SLIST_FOREACH(kn, &fdp->fd_knhash[b], kn_link) {
++			if (kn->kn_filter != EVFILT_TIMER) {
++				continue;
++			}
++			++total;
++			if (shown >= 40) {
++				continue;
++			}
++			++shown;
++			uint64_t base = (kn->kn_sfflags & NOTE_MACH_CONTINUOUS_TIME) ? cont : now;
++			uint64_t dl = kn->kn_ext[0], ns = 0;
++			absolutetime_to_nanoseconds(dl > base ? dl - base : base - dl, &ns);
++			printf("SURYA VIB: timer id %#llx sfflags %#x status %#x deadline %#llx %s%llu ms "
++			    "leeway %llu interval %lld\n", kn->kn_id, kn->kn_sfflags,
++			    (unsigned)kn->kn_status, dl, dl > base ? "in " : "past ", ns / 1000000ULL,
++			    kn->kn_ext[1], kn->kn_sdata);
++		}
++	}
++	lck_mtx_unlock(&fdp->fd_knhashlock);
++	printf("SURYA VIB: %u timer knotes, kernel now %#llx continuous %#llx\n", total, now, cont);
++}
++
 +static void
 +surya_vib_abort(void)
 +{
@@ -2223,6 +2265,7 @@ suryavib=0 leaves the chip alone.
 +				if (task != TASK_NULL) {
 +					sweet_sample_task(name, pid, task);
 +				}
++				surya_vib_dump_timers(p);
 +				proc_rele(p);
 +			}
 +		}
@@ -2318,7 +2361,7 @@ suryavib=0 leaves the chip alone.
  void
  sweet_touch_init(void)
  {
-@@ -644,17 +2905,35 @@
+@@ -644,17 +2948,35 @@
  		return;
  	}
  	st.started = true;
