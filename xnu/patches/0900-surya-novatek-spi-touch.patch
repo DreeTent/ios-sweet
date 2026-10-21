@@ -48,6 +48,9 @@ OSM tables for the small cluster, the big one and L3, written to
 DCVS_PERF_STATE_DESIRED as Linux's clk-cpu-osm does, 65 s after start;
 at 85 C (TSENS) the bootloader's rows come back until below 70 C. Without
 the boot-arg nothing is written.
+Memory bandwidth, suryaddr=1 (22.10): 70 s after start the top votes for
+the RPMh bus clock managers MC0, ACV and SH0 through sweet_rpmh_bcm_vote()
+(0912). Nothing is voted otherwise.
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
 @@ -14,12 +14,29 @@
@@ -80,7 +83,7 @@ the boot-arg nothing is written.
  void sweet_touch_init(void);
  
  #define TOUCH_SE_PA      0x00a84000u
-@@ -635,6 +652,2721 @@
+@@ -635,6 +652,2744 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -2799,10 +2802,33 @@ the boot-arg nothing is written.
 +	}
 +}
 +
++/*
++ * Memory bandwidth, boot-arg suryaddr=1 (wishes/04, step 5): 70 s after start
++ * the top votes (0x3fff, what Linux's bcm-voter clamps big requests to) for
++ * the RPMh bus clock managers of DDR (MC0), its voltage corner (ACV) and the
++ * system cache (SH0), through sweet_rpmh_bcm_vote() (bsd/dev/sweet_rpmh.c).
++ * Nothing is voted otherwise. Check: the copy speeds of suryastat=1 and the
++ * OSM/PMU numbers before and after.
++ */
++extern int sweet_rpmh_bcm_vote(const char *const *names, unsigned n, uint32_t vote_x, uint32_t vote_y);
++
++static void
++surya_ddr_thread(void *arg, wait_result_t result)
++{
++	static const char *const names[3] = {"MC0", "ACV", "SH0"};
++	(void)arg;
++	(void)result;
++	touch_wait(70000);
++	int err = sweet_rpmh_bcm_vote(names, 3, 0x3fffu, 0x3fffu);
++	printf("SURYA DDR: MC0/ACV/SH0 top votes -> %d\n", err);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
  void
  sweet_touch_init(void)
  {
-@@ -644,17 +3376,56 @@
+@@ -644,17 +3399,67 @@
  		return;
  	}
  	st.started = true;
@@ -2844,6 +2870,17 @@ the boot-arg nothing is written.
 +			thread_deallocate(thread);
 +		} else {
 +			printf("SURYA FREQ: kernel_thread_start failed %d\n", kr);
++		}
++	}
++	/* suryaddr=1: memory bandwidth votes above. */
++	int ddr = 0;
++	(void)PE_parse_boot_argn("suryaddr", &ddr, sizeof(ddr));
++	if (enabled == 2 && ddr) {
++		kr = kernel_thread_start(surya_ddr_thread, NULL, &thread);
++		if (kr == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			printf("SURYA DDR: kernel_thread_start failed %d\n", kr);
 +		}
 +	}
 +	/* surya's vibration motor, unless suryavib=0. */

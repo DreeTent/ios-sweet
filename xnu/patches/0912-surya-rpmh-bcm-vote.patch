@@ -1,0 +1,194 @@
+sweet: RPMh bus-clock-manager votes for surya (memory bandwidth)
+
+The RPMh client (0062) only knew the PM6150L L11C rail. surya adds
+sweet_rpmh_bcm_vote(): cmd-db lookup of BCM resources (slave 5) and one
+ACTIVE TCS with their TCS commands (Linux bcm-voter's BCM_TCS_CMD: commit,
+valid, vote_x, vote_y), through the same TCS path as the rail vote.
+bsd/dev/sweet_touch.c (0900) asks the top votes for MC0 (DDR), ACV and
+SH0 (LLCC) with boot-arg suryaddr=1; nothing is voted otherwise.
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -44,8 +44,12 @@
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+ #define RH_VRM          4u
++#define RH_BCM          5u       /* surya: bus clock managers (memory bandwidth) */
+ #define RH_TIMEOUT_US   100000u
+ 
++/* surya: top votes for named BCM resources, as bcm-voter's BCM_TCS_CMD. */
++int sweet_rpmh_bcm_vote(const char *const *names, unsigned n, uint32_t vote_x, uint32_t vote_y);
++
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+ static uint32_t rh_db_size;
+ static unsigned rh_ncpt;
+@@ -159,7 +163,7 @@
+ }
+ 
+ static int
+-rh_lookup(const char *res, uint32_t *address)
++rh_lookup(const char *res, unsigned want_slave, uint32_t *address)
+ {
+ 	uint32_t key[2] = {0, 0};
+ 	for (unsigned i = 0; i < 8 && res[i]; ++i) {
+@@ -186,9 +190,9 @@
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
++			if (slave != want_slave || (addr >> 16) != want_slave || (addr & 15u) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++				printf("SWEET RPMH: invalid slave-%u entry for %s\n", want_slave, res);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
+@@ -196,6 +200,12 @@
+ 			printf("SWEET RPMH: %s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
+ 			    res, addr, slave, rh_db16(h + 8),
+ 			    rh_read(rh_db, e + 8), rh_read(rh_db, e + 12));
++			if (want_slave == RH_BCM && rh_db16(e + 20) >= 8) {
++				/* bcm_db: unit (u32), width (u16), vcd (u8); 16-bit reads keep alignment */
++				uint32_t a = aux + rh_db16(e + 22);
++				printf("SWEET RPMH: %s bcm unit=%u width=%u vcd=%u\n", res,
++				    rh_db16(a) | ((uint32_t)rh_db16(a + 2) << 16), rh_db16(a + 4), rh_db16(a + 6) & 0xffu);
++			}
+ 		}
+ 	}
+ 	if (matches != 1) {
+@@ -218,10 +228,14 @@
+ 	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+ }
+ 
++/* surya: one ACTIVE TCS carrying n (at most 3) write commands addrs/datas. */
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_send_cmds(const uint32_t *addrs, const uint32_t *datas, unsigned n, const char *what)
+ {
+ 	int chosen = -1;
++	if (n == 0 || n > 3) {
++		return EINVAL;
++	}
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+ 		uint32_t b = t * RH_TCS_STRIDE;
+ 		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
+@@ -232,9 +246,12 @@
+ 			return EIO;
+ 		}
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+-			if ((enabled & (1u << c)) &&
+-			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++			bool ours = false;
++			for (unsigned k = 0; k < n; ++k) {
++				ours = ours || (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == (addrs[k] & ~15u);
++			}
++			if ((enabled & (1u << c)) && ours) {
++				printf("SWEET RPMH: conflicting inherited %s request in TCS%u\n", what, t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -266,19 +283,18 @@
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	uint32_t mask = (1u << n) - 1u;
++	printf("SWEET RPMH: TCS%u ACTIVE %s: %u commands, irq-enable=%#x\n", t, what, n, irq_en);
++	for (unsigned c = 0; c < n; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
++		printf("SWEET RPMH:  cmd%u addr=%#x data=%#x\n", c, addrs[c], datas[c]);
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+-		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
+-		    !rh_sync(cmd + RH_DATA, values[c])) {
++		    !rh_sync(cmd + RH_ADDR, addrs[c]) ||
++		    !rh_sync(cmd + RH_DATA, datas[c])) {
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, mask) || !rh_sync(b + RH_ENABLE, mask) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
+@@ -289,7 +305,7 @@
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < n; ++c) {
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+@@ -320,10 +336,58 @@
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: %s ACTIVE vote complete (the effect requires hardware verification)\n", what);
+ 	return 0;
+ }
+ 
++/* The L11C rail: voltage, HPM mode (raw 7, as this PMIC5 LDO supports), enable last. */
++static int
++rh_send(uint32_t address, unsigned mv)
++{
++	const uint32_t addrs[3] = {address, address + 8, address + 4};
++	const uint32_t datas[3] = {mv, 7, 1};
++	printf("SWEET RPMH: L11C %u mV mode=7 enable=1\n", mv);
++	return rh_send_cmds(addrs, datas, 3, "L11C");
++}
++
++/*
++ * surya: Linux bcm-voter's tcs_cmd_gen for n BCMs in one TCS:
++ * data = commit << 30 | valid << 29 | vote_x << 14 | vote_y (14-bit votes,
++ * clamped as bcm-voter clamps them). commit on every command: each BCM here
++ * may be its own voltage control domain.
++ */
++int
++sweet_rpmh_bcm_vote(const char *const *names, unsigned n, uint32_t vote_x, uint32_t vote_y)
++{
++	uint32_t addrs[3], datas[3];
++	if (!names || n == 0 || n > 3) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	for (unsigned k = 0; k < n && !error; ++k) {
++		error = rh_lookup(names[k], RH_BCM, &addrs[k]);
++		uint32_t x = vote_x > 0x3fffu ? 0x3fffu : vote_x, y = vote_y > 0x3fffu ? 0x3fffu : vote_y;
++		datas[k] = (1u << 30) | ((x || y) ? (1u << 29) : 0u) | (x << 14) | y;
++	}
++	if (!error) {
++		error = rh_send_cmds(addrs, datas, n, "BCM");
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: BCM vote failed errno=%d\n", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+@@ -343,7 +407,7 @@
+ 	}
+ 	error = rh_map();
+ 	if (!error) {
+-		error = rh_lookup(res, &address);
++		error = rh_lookup(res, RH_VRM, &address);
+ 	}
+ 	if (!error) {
+ 		error = rh_send(address, mv);
