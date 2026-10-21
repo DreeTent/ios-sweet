@@ -1,0 +1,58 @@
+sweet: platform clock hooks for a board RTC
+
+IOPlatformExpert::getGMTTimeOfDay returns 0, so iOS started at 1970 on every
+boot. SweetPlatformExpert now asks sweet_rtc_get_hook/sweet_rtc_set_hook
+when a board driver sets them (surya: the PM6150 RTC in SweetBattery.cpp,
+which then publishes the IORTC resource IOKitInitializeTime waits for).
+Without hooks the behaviour is unchanged.
+
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -10,6 +10,18 @@
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
+ 
++/*
++ * Wall clock. IOPlatformExpert returns 0 from getGMTTimeOfDay, so iOS started
++ * at 1970 on every boot. A board driver that owns a real-time clock sets these
++ * hooks before publishing the IORTC resource that IOKitInitializeTime waits for
++ * (surya: the PM6150 RTC, iokit/Kernel/arm/SweetBattery.cpp). Without hooks
++ * nothing changes.
++ */
++extern "C" {
++long (*sweet_rtc_get_hook)(void) = NULL;
++void (*sweet_rtc_set_hook)(long secs) = NULL;
++}
++
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+ 
+@@ -18,10 +30,28 @@
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	return sweet_rtc_get_hook ? sweet_rtc_get_hook() : IODTPlatformExpert::getGMTTimeOfDay();
++}
++
++void
++SweetPlatformExpert::setGMTTimeOfDay(long secs)
++{
++	if (sweet_rtc_set_hook) {
++		sweet_rtc_set_hook(secs);
++	} else {
++		IODTPlatformExpert::setGMTTimeOfDay(secs);
++	}
++}
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
