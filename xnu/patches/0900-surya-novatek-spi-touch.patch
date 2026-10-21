@@ -2214,7 +2214,7 @@ suryavib=0 leaves the chip alone.
 +			sampled = true;
 +			++svib.samples;
 +			proc_t p = proc_find(pid);
-+			if (p != PROC_NULL) {
++			if (p != NULL) {
 +				char name[32];
 +				proc_name(pid, name, sizeof(name));
 +				printf("SURYA VIB: repeating pattern from %s[%d] 3 s without a stop; its threads:\n",
