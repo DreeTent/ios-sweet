@@ -30,6 +30,10 @@ with IORegistryEntrySetCFProperties: {hertz_millisecs: [state, ms, ...],
 repeat}, a state being {intensity: 16.16} or false, and a bare number 0 to
 stop. setProperties logs what arrives and hands the pairs to surya_vib_play()
 (0900).
+The service also carries a "name" property, as a device-tree nub does:
+MobileGestalt's VibratorCapability looks for it, and without it Settings hides
+the vibration items. setProperties logs the sender and, for the first two
+calls, its threads (22.10: a 1 s vibration was never stopped by iOS).
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
 @@ -3,6 +3,15 @@
@@ -191,7 +195,7 @@ stop. setProperties logs what arrives and hands the pairs to surya_vib_play()
  		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
  		    (charging ? kIOBatteryCharge : 0))};
  		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
-@@ -246,41 +330,769 @@
+@@ -246,41 +330,793 @@
  	    charging, full, true, currentValid);
  }
  
@@ -820,6 +824,9 @@ stop. setProperties logs what arrives and hands the pairs to surya_vib_play()
 +#define SURYA_VIB_MAX_PAIRS 64u
 +
 +extern "C" int surya_vib_play(const uint32_t *pairs, unsigned n, int repeat);
++extern "C" int proc_selfpid(void);
++extern "C" void proc_selfname(char *buf, int size);
++extern "C" void sweet_sample_task(const char *name, int pid, task_t task); /* osfmk/kern/exception.c */
 +
 +class SuryaVibrator : public IOService {
 +	OSDeclareDefaultStructors(SuryaVibrator);
@@ -839,6 +846,14 @@ stop. setProperties logs what arrives and hands the pairs to surya_vib_play()
 +	}
 +	fLines = 0;
 +	setName("vibrator");
++	/* MobileGestalt's VibratorCapability (libMobileGestalt sub_19c575448, 22.10):
++	 * IOServiceNameMatching("vibrator") and the entry's "name" property, as a
++	 * device-tree nub has it. Without it Settings hides every vibration item. */
++	OSData *name = OSData::withBytes("vibrator", sizeof("vibrator"));
++	if (name) {
++		setProperty("name", name);
++		name->release();
++	}
 +	registerService();
 +	IOLog("SURYA VIB: \"vibrator\" service registered\n");
 +	return true;
@@ -848,14 +863,27 @@ stop. setProperties logs what arrives and hands the pairs to surya_vib_play()
 +SuryaVibrator::setProperties(OSObject *properties)
 +{
 +	if (fLines < 300) {
++		/* The live USB log cuts lines near 250 bytes: the caller, then the
++		 * properties in 180-byte pieces; the caller's threads for the first two. */
 +		++fLines;
++		char who[32] = "?";
++		int pid = proc_selfpid();
++		proc_selfname(who, sizeof(who));
 +		OSSerialize *s = OSSerialize::withCapacity(512);
 +		if (s && properties && properties->serialize(s)) {
-+			IOLog("SURYA VIB: setProperties %.900s\n", s->text());
++			const char *text = s->text();
++			size_t len = strlen(text);
++			IOLog("SURYA VIB: setProperties from %s[%d], %u bytes\n", who, pid, (unsigned)len);
++			for (size_t off = 0; off < len && off < 3600; off += 180) {
++				IOLog("SURYA VIB:  %.180s\n", text + off);
++			}
 +		} else {
-+			IOLog("SURYA VIB: setProperties (not serializable)\n");
++			IOLog("SURYA VIB: setProperties from %s[%d] (not serializable)\n", who, pid);
 +		}
 +		OSSafeReleaseNULL(s);
++		if (fLines <= 2) {
++			sweet_sample_task(who, pid, current_task());
++		}
 +	}
 +	if (OSDynamicCast(OSNumber, properties)) {
 +		return surya_vib_play(NULL, 0, 0) ? kIOReturnNotReady : kIOReturnSuccess;
@@ -964,7 +992,7 @@ stop. setProperties logs what arrives and hands the pairs to surya_vib_play()
  	return true;
  }
  
-@@ -314,6 +1126,8 @@
+@@ -314,6 +1150,8 @@
  {
  	OSSafeReleaseNULL(fTimer);
  	OSSafeReleaseNULL(fLoop);

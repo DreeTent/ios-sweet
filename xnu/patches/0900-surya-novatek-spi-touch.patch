@@ -37,7 +37,7 @@ shared with the touch (surya_qup_clocks, one lock for the GCC vote register).
 suryavib=0 leaves the chip alone.
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -14,12 +14,26 @@
+@@ -14,12 +14,27 @@
  #include <kern/sched_prim.h>
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
@@ -46,6 +46,7 @@ suryavib=0 leaves the chip alone.
 +#include <sys/fcntl.h>
 +#include <sys/uio.h>
 +#include <sys/vnode.h>
++#include <sys/proc.h>
 +#include <IOKit/IOLocks.h>
 +#include "sweet_spmi.h"
 +
@@ -64,7 +65,7 @@ suryavib=0 leaves the chip alone.
  void sweet_touch_init(void);
  
  #define TOUCH_SE_PA      0x00a84000u
-@@ -635,6 +649,2224 @@
+@@ -635,6 +650,2252 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -1688,8 +1689,13 @@ suryavib=0 leaves the chip alone.
 +	uint32_t seg[2 * SURYA_VIB_MAX_SEG];
 +	unsigned nseg, gen;
 +	bool repeat;
++	int pid;            /* who sent the pattern */
++	unsigned samples;
 +} svib;
 +static int svib_chan;
++
++extern task_t proc_task(proc_t);
++extern void sweet_sample_task(const char *name, int pid, task_t task); /* osfmk/kern/exception.c */
 +
 +static void
 +surya_vib_abort(void)
@@ -2181,7 +2187,8 @@ suryavib=0 leaves the chip alone.
 +{
 +	uint32_t seg[2 * SURYA_VIB_MAX_SEG];
 +	unsigned n = 0, i = 0, gen = 0;
-+	bool repeat = false;
++	bool repeat = false, sampled = false;
++	int pid = 0;
 +	uint64_t started = 0;
 +	for (;;) {
 +		IOLockLock(svib.lock);
@@ -2189,14 +2196,35 @@ suryavib=0 leaves the chip alone.
 +			gen = svib.gen;
 +			n = svib.nseg;
 +			repeat = svib.repeat;
++			pid = svib.pid;
 +			bcopy(svib.seg, seg, sizeof(seg[0]) * 2u * n);
 +			i = 0;
 +			started = surya_now_ns();
++			sampled = false;
 +		}
 +		IOLockUnlock(svib.lock);
 +		if (i < n && surya_now_ns() - started > SURYA_VIB_CAP_NS) {
 +			printf("SURYA VIB: pattern still running after 120 s; stopped\n");
 +			n = 0;
++		}
++		/* 22.10: a 1 s ConnectedToPower vibration repeated until the 120 s cap,
++		 * iOS never sent the stop. Where are the sender's threads 3 s in? */
++		if (i < n && repeat && !sampled && svib.samples < 3 &&
++		    surya_now_ns() - started > 3000000000ULL) {
++			sampled = true;
++			++svib.samples;
++			proc_t p = proc_find(pid);
++			if (p != PROC_NULL) {
++				char name[32];
++				proc_name(pid, name, sizeof(name));
++				printf("SURYA VIB: repeating pattern from %s[%d] 3 s without a stop; its threads:\n",
++				    name, pid);
++				task_t task = proc_task(p);
++				if (task != TASK_NULL) {
++					sweet_sample_task(name, pid, task);
++				}
++				proc_rele(p);
++			}
 +		}
 +		if (i >= n) {
 +			surya_vib_drive(0);
@@ -2236,6 +2264,7 @@ suryavib=0 leaves the chip alone.
 +	}
 +	svib.nseg = n;
 +	svib.repeat = repeat && n;
++	svib.pid = proc_selfpid();
 +	++svib.gen;
 +	IOLockUnlock(svib.lock);
 +	thread_wakeup(&svib_chan);
@@ -2289,7 +2318,7 @@ suryavib=0 leaves the chip alone.
  void
  sweet_touch_init(void)
  {
-@@ -644,17 +2876,35 @@
+@@ -644,17 +2905,35 @@
  		return;
  	}
  	st.started = true;
