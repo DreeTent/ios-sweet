@@ -183,7 +183,7 @@ notification LED (0900) with the last published charger state.
  		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
  		    (charging ? kIOBatteryCharge : 0))};
  		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
-@@ -246,41 +329,663 @@
+@@ -246,41 +329,669 @@
  	    charging, full, true, currentValid);
  }
  
@@ -640,8 +640,14 @@ notification LED (0900) with the last published charger state.
 +	if (level) {
 +		err |= sweet_spmi_write(5, 0xd953, (uint8_t)(level & 0xffu));
 +		err |= sweet_spmi_write(5, 0xd954, (uint8_t)((level >> 8) & 0x0fu));
++		/* The level latches on the MOD_A sync bit's 0 -> 1 edge. The
++		 * bootloader leaves the bit set (sync 0x1 in the first snapshot), so
++		 * qcom-spmi-wled's set-then-clear alone missed the first level after
++		 * boot (the restored brightness stayed at the bootloader's 2047):
++		 * clear, set, clear. */
 +		err |= sweet_spmi_read(5, 0xd965, &sync);
-+		err |= sweet_spmi_write(5, 0xd965, (uint8_t)((sync & ~0x3u) | 0x1u));
++		err |= sweet_spmi_write(5, 0xd965, (uint8_t)(sync & ~0xfu));
++		err |= sweet_spmi_write(5, 0xd965, (uint8_t)((sync & ~0xfu) | 0x1u));
 +		err |= sweet_spmi_write(5, 0xd965, (uint8_t)(sync & ~0xfu));
 +		if (fLevel <= 0) {
 +			err |= sweet_spmi_read(5, 0xd846, &en);
@@ -850,7 +856,7 @@ notification LED (0900) with the last published charger state.
  	return true;
  }
  
-@@ -314,6 +1019,7 @@
+@@ -314,6 +1025,7 @@
  {
  	OSSafeReleaseNULL(fTimer);
  	OSSafeReleaseNULL(fLoop);

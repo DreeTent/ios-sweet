@@ -52,7 +52,7 @@ writes the small state files in /private/var/db (time, backlight).
  void sweet_touch_init(void);
  
  #define TOUCH_SE_PA      0x00a84000u
-@@ -635,6 +648,1427 @@
+@@ -635,6 +648,1430 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -1387,6 +1387,7 @@ writes the small state files in /private/var/db (time, backlight).
 +
 +static int surya_led_ok = -1;
 +static unsigned surya_led_duty;
++static uint8_t surya_led_size;  /* LPG_SIZE_CLK resolution bits for the subtype */
 +
 +static int
 +surya_led_check(void)
@@ -1400,7 +1401,9 @@ writes the small state files in /private/var/db (time, backlight).
 +	int err = sweet_spmi_read(5, 0xb104, &type);
 +	err |= sweet_spmi_read(5, 0xb105, &subtype);
 +	err |= sweet_spmi_read(5, 0xd046, &en);
-+	surya_led_ok = !err && lown == 0 && town == 0 && subtype == 0x02; /* LPG_SUBTYPE_LPG */
++	/* surya reads subtype 0x11, LPG_SUBTYPE_LPG_LITE (21.10); the full LPG is 0x02. */
++	surya_led_ok = !err && lown == 0 && town == 0 && (subtype == 0x11 || subtype == 0x02);
++	surya_led_size = subtype == 0x02 ? 0x30 : 0x10; /* lpg_apply_freq: LPG GENMASK(5,4), Lite BIT(4) */
 +	printf("SURYA LED: lpg type %#x subtype %#x apid %u owner %d, triled en %#x apid %u owner %d -> %s\n",
 +	    type, subtype, lapid, lown, en, tapid, town, surya_led_ok ? "usable" : "NOT usable");
 +	return surya_led_ok;
@@ -1417,7 +1420,7 @@ writes the small state files in /private/var/db (time, backlight).
 +		uint8_t tc = 0;
 +		err |= sweet_spmi_read(5, 0xb143, &tc);
 +		err |= sweet_spmi_write(5, 0xb143, (uint8_t)(tc | 0x20u));  /* glitch removal off */
-+		err |= sweet_spmi_write(5, 0xb141, 0x33);                   /* 19.2 MHz, LPG size */
++		err |= sweet_spmi_write(5, 0xb141, (uint8_t)(0x03u | surya_led_size)); /* 19.2 MHz */
 +		err |= sweet_spmi_write(5, 0xb142, 0x43);                   /* pre-divide 5, 2^3 */
 +		err |= sweet_spmi_write(5, 0xb144, (uint8_t)(duty & 0xffu));
 +		err |= sweet_spmi_write(5, 0xb145, (uint8_t)(duty >> 8));
@@ -1480,7 +1483,7 @@ writes the small state files in /private/var/db (time, backlight).
  void
  sweet_touch_init(void)
  {
-@@ -644,13 +2078,16 @@
+@@ -644,13 +2081,16 @@
  		return;
  	}
  	st.started = true;
