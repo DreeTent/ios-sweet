@@ -1,0 +1,62 @@
+sweet: live USB log from the start of boot
+
+Right after SET_CONFIGURATION the PC has no address on its side yet, so the
+boot backlog went out in one burst into nowhere and the log began at
+SpringBoard. The log thread now starts 1 s after the first frame from the
+PC (10 s at most), lets ARP resolve on the first datagram, paces bursts
+(a full 32-frame queue drops silently) and resends a chunk sock_send
+refused.
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -817,6 +817,8 @@
+ 	socket_t so = NULL;
+ 	struct sockaddr_in to;
+ 	uint64_t pos = sweet_log_position();
++	unsigned waited = 0, after_rx = 0;
++	bool started = false;
+ 
+ 	pos = pos > 65536 ? pos - 65536 : 0;
+ 	bzero(&to, sizeof(to));
+@@ -829,11 +831,25 @@
+ 		if (!ud.configured) {
+ 			continue;
+ 		}
++		/*
++		 * surya: right after SET_CONFIGURATION the PC has no address on its
++		 * side yet, and the boot backlog went out in one burst into nowhere
++		 * (the log began at SpringBoard). Start 1 s after the first frame
++		 * from the PC (10 s at most), let ARP resolve on the first datagram,
++		 * and pace bursts: a full 32-frame queue drops silently.
++		 */
++		if (!started) {
++			waited += 100;
++			after_rx += ud.rx_frames != 0 ? 100 : 0;
++			if (after_rx < 1000 && waited < 10000) {
++				continue;
++			}
++		}
+ 		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+ 			so = NULL;
+ 			continue;
+ 		}
+-		uint32_t n;
++		uint32_t n, k = 0;
+ 		while ((n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
+ 			struct iovec iov = { .iov_base = chunk, .iov_len = n };
+ 			struct msghdr msg = {
+@@ -842,8 +858,15 @@
+ 			};
+ 			size_t sent = 0;
+ 			if (sock_send(so, &msg, 0, &sent) != 0) {
++				pos -= n;       /* surya: resend this chunk next time */
+ 				break;          /* no route/ARP yet: retry later */
+ 			}
++			if (!started) {
++				started = true;
++				ud_sleep_ms(300);
++			} else if (++k % 16 == 0) {
++				ud_sleep_ms(2);
++			}
+ 		}
+ 	}
+ }

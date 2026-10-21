@@ -1,0 +1,55 @@
+sweet: sampler backtraces over several lines
+
+The live USB log cuts lines near 250 bytes, so the 16-frame backtrace on one
+line lost its callers. Each thread now gets a pc/lr/sp line and then up to
+64 frames, 8 per line, as "SMP name tN bt+K ...".
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1014,28 +1014,42 @@
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+ 		arm_saved_state_t *ss = find_user_regs(thread);
+-		char line[400];
+-		int n;
++		char line[200];
++		int n, t;
+ 		uint64_t fp;
+ 
+ 		if (ss == NULL || !is_saved_state64(ss)) {
+ 			continue;
+ 		}
+ 		fp = get_saved_state_fp(ss);
+-		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
++		t = tn++;
++		printf("SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx\n", name, t,
+ 		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
+-		for (int i = 0; i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
++		/*
++		 * surya: the live USB log cuts lines near 250 bytes, which hid the
++		 * callers. Up to 64 frames, 8 per line: "SMP name tN bt+K ...".
++		 */
++		n = 0;
++		for (int i = 0; i < 64 && fp != 0 && (fp & 7) == 0; i++) {
+ 			uint64_t frame[2];
+ 			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
+ 				break;
+ 			}
++			if (i % 8 == 0) {
++				if (n) {
++					printf("%s\n", line);
++				}
++				n = snprintf(line, sizeof(line), "SMP %s t%d bt+%d", name, t, i);
++			}
+ 			n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
+ 			if (frame[0] <= fp) {
+ 				break;
+ 			}
+ 			fp = frame[0];
+ 		}
+-		printf("%s\n", line);
++		if (n) {
++			printf("%s\n", line);
++		}
+ 	}
+ 	task_unlock(task);
+ }
