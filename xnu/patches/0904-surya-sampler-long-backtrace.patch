@@ -3,9 +3,14 @@ sweet: sampler backtraces over several lines
 The live USB log cuts lines near 250 bytes, so the 16-frame backtrace on one
 line lost its callers. Each thread now gets a pc/lr/sp line and then up to
 64 frames, 8 per line, as "SMP name tN bt+K ...".
+
+Also (22.10) surya_cpu_idle_mask() and surya_cpu_measure() for the
+suryastat=1 measurements in bsd/dev/sweet_touch.c: the scheduler's idle
+processors, and one processor's PMCCNTR_EL0 against CNTVCT_EL0 while bound
+to it.
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -1014,28 +1014,42 @@
+@@ -1014,32 +1014,99 @@
  	task_lock(task);
  	queue_iterate(&task->threads, thread, thread_t, task_threads) {
  		arm_saved_state_t *ss = find_user_regs(thread);
@@ -53,3 +58,60 @@ line lost its callers. Each thread now gets a pc/lr/sp line and then up to
  	}
  	task_unlock(task);
  }
+ 
++/*
++ * surya measurements (bsd/dev/sweet_touch.c, boot-arg suryastat=1): which
++ * processors the scheduler has idle right now, and one processor's cycle
++ * counter against the system counter. Both read-only. The ARM PMUv3 cycle
++ * counter (PMCCNTR_EL0) is free: this kernel's kpc knows Apple PMUs only.
++ */
++unsigned surya_cpu_idle_mask(void);
++int surya_cpu_measure(unsigned cpu, unsigned ms, uint64_t *cycles, uint64_t *ticks);
++
++unsigned
++surya_cpu_idle_mask(void)
++{
++	unsigned mask = 0;
++	for (unsigned i = 0; i < processor_count && i < 32; ++i) {
++		processor_t p = processor_array[i];
++		if (p != PROCESSOR_NULL && p->state == PROCESSOR_IDLE) {
++			mask |= 1u << i;
++		}
++	}
++	return mask;
++}
++
++int
++surya_cpu_measure(unsigned cpu, unsigned ms, uint64_t *cycles, uint64_t *ticks)
++{
++	if (cpu >= processor_count || processor_array[cpu] == PROCESSOR_NULL) {
++		return -1;
++	}
++	processor_t old = thread_bind(processor_array[cpu]);
++	thread_block(THREAD_CONTINUE_NULL); /* move there now */
++	if (current_processor() != processor_array[cpu]) {
++		thread_bind(old);
++		return -2;
++	}
++	uint64_t pmcr = __builtin_arm_rsr64("PMCR_EL0");
++	__builtin_arm_wsr64("PMCR_EL0", pmcr | 0x5ULL); /* E: enable, C: reset the cycle counter */
++	__builtin_arm_wsr64("PMCNTENSET_EL0", 1ULL << 31);
++	__asm__ volatile ("isb" ::: "memory");
++	uint64_t freq = __builtin_arm_rsr64("CNTFRQ_EL0");
++	uint64_t t0 = __builtin_arm_rsr64("CNTVCT_EL0");
++	uint64_t c0 = __builtin_arm_rsr64("PMCCNTR_EL0");
++	uint64_t t1 = t0, end = t0 + freq * ms / 1000ULL;
++	while (t1 < end) {
++		t1 = __builtin_arm_rsr64("CNTVCT_EL0");
++	}
++	uint64_t c1 = __builtin_arm_rsr64("PMCCNTR_EL0");
++	__asm__ volatile ("isb" ::: "memory");
++	thread_bind(old);
++	*cycles = c1 - c0;
++	*ticks = t1 - t0;
++	return 0;
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ kern_return_t

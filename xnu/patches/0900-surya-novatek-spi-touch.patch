@@ -35,9 +35,17 @@ milliseconds, optionally repeated, played by one thread; intensity scales the
 drive level; a pattern nobody stopped ends after 120 s. The SE clock code is
 shared with the touch (surya_qup_clocks, one lock for the GCC vote register).
 suryavib=0 leaves the chip alone.
+
+Measurements, suryastat=1 (22.10, read-only): 60 s after start the OSM
+clock tables and requests of L3 and both clusters, every CPU's real
+frequency (PMU cycle counter against the 19.2 MHz counter), copy speeds
+(cache, panel), the MDSS SSPP/CTL/INTF registers and the panel's frame
+rate, and whether 1 s thread_calls on the absolute and continuous clocks
+fire; then every 10 s swaps, repeated swaps, panel copy times, vsync
+ticks, panel frames, per-CPU idle share and TSENS temperatures.
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -14,12 +14,27 @@
+@@ -14,12 +14,29 @@
  #include <kern/sched_prim.h>
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
@@ -47,6 +55,8 @@ suryavib=0 leaves the chip alone.
 +#include <sys/uio.h>
 +#include <sys/vnode.h>
 +#include <sys/proc.h>
++#include <kern/kalloc.h>
++#include <kern/thread_call.h>
 +#include <IOKit/IOLocks.h>
 +#include "sweet_spmi.h"
 +
@@ -65,7 +75,7 @@ suryavib=0 leaves the chip alone.
  void sweet_touch_init(void);
  
  #define TOUCH_SE_PA      0x00a84000u
-@@ -635,6 +650,2252 @@
+@@ -635,6 +652,2563 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -2315,10 +2325,321 @@ suryavib=0 leaves the chip alone.
 +	}
 +}
 +
++/*
++ * Measurements, boot-arg suryastat=1 (notes/wishes/04, step 3): read-only,
++ * nothing is configured. Once, 60 s after start:
++ *  - OSM (qcom,clk-cpu-osm-sdmmagpie, Xiaomi clk-cpu-osm.c): L3, the small
++ *    and the big cluster: enable bit, the frequency table (+0x110 + 32 i:
++ *    bits 31:30 source, 7:0 multiplier of 19.2 MHz, source 0 = 300 MHz),
++ *    the requested row per core (+0x920 + 4 n) and the cycle counters
++ *    (+0x9c0 + 4 n) over one second;
++ *  - every CPU's PMU cycle counter against the 19.2 MHz counter for 20 ms;
++ *  - copy speed: cache to cache, panel to cache, cache to panel;
++ *  - MDSS (Xiaomi DT qcom,sde-*-off): the five SSPP channels, six CTLs and
++ *    four interfaces, and the DSI interfaces' frame counters over 1 s;
++ *  - the kernel's own timers: one thread_call on the absolute and one on the
++ *    continuous clock, 1 s each (the vibration stop timer never fired).
++ * Then every 10 s: swaps, repeated swaps, panel copies (mean and max time),
++ * vsync ticks, each CPU's idle share, panel frames, TSENS temperatures.
++ */
++#define STAT_OSM_L3_PA    0x18321000u
++#define STAT_OSM_PWR_PA   0x18323000u
++#define STAT_OSM_PERF_PA  0x18325800u
++#define STAT_MDSS_PA      0x0ae00000u
++#define STAT_TSENS0_PA    0x0c263000u /* TM blocks (second reg of tsens@c222000/c223000) */
++#define STAT_TSENS1_PA    0x0c265000u
++#define STAT_COPY_BYTES   (4u << 20)
++
++extern unsigned surya_cpu_idle_mask(void);                 /* osfmk/kern/exception.c */
++extern int surya_cpu_measure(unsigned cpu, unsigned ms, uint64_t *cycles, uint64_t *ticks);
++extern int sweet_fb_stat_on;                               /* iokit/Kernel/arm/SweetFramebuffer.cpp */
++extern uint64_t sweet_fb_stat_swaps, sweet_fb_stat_dups, sweet_fb_stat_copies;
++extern uint64_t sweet_fb_stat_copy_ns, sweet_fb_stat_copy_max_ns, sweet_fb_stat_ticks;
++extern uintptr_t sweet_fb_stat_pixels;
++extern uint32_t sweet_fb_stat_rowbytes, sweet_fb_stat_width, sweet_fb_stat_height;
++extern unsigned int processor_count;
++
++static struct {
++	vm_offset_t l3, pwr, perf, mdss, tsens[2];
++	volatile int fired[2];
++	uint64_t fired_at[2];
++} sst;
++
++static void
++stat_osm(const char *name, vm_offset_t base, unsigned cores)
++{
++	if (!base) {
++		return;
++	}
++	printf("SURYA STAT: OSM %s enable %#x dcvs_ctrl %#x\n", name,
++	    touch_rd(base, 0), touch_rd(base, 0xbc));
++	char line[200];
++	int n = 0;
++	unsigned rows = 0;
++	for (unsigned i = 0; i < 40; ++i) {
++		uint32_t v = touch_rd(base, 0x110u + 32u * i);
++		unsigned mhz = ((v >> 30) & 3u) ? (v & 0xffu) * 192u / 10u : 300u;
++		if (i && v == touch_rd(base, 0x110u + 32u * (i - 1u))) {
++			break; /* the table ends where it repeats (clk_osm_resources_init) */
++		}
++		rows = i + 1;
++		n += snprintf(line + n, sizeof(line) - (size_t)n, " %u:%u", i, mhz);
++		if (i % 10 == 9 || i == 39) {
++			printf("SURYA STAT: OSM %s rows%s\n", name, line);
++			n = 0;
++		}
++	}
++	if (n) {
++		printf("SURYA STAT: OSM %s rows%s\n", name, line);
++	}
++	n = 0;
++	for (unsigned c = 0; c < cores; ++c) {
++		n += snprintf(line + n, sizeof(line) - (size_t)n, " c%u:%u", c,
++		    touch_rd(base, 0x920u + 4u * c));
++	}
++	printf("SURYA STAT: OSM %s %u rows, requested row%s\n", name, rows, line);
++	uint32_t c0[8], c1[8];
++	for (unsigned c = 0; c < cores && c < 8; ++c) {
++		c0[c] = touch_rd(base, 0x9c0u + 4u * c);
++	}
++	uint64_t t0 = surya_now_ns();
++	touch_wait(1000);
++	uint64_t dt = surya_now_ns() - t0;
++	n = 0;
++	for (unsigned c = 0; c < cores && c < 8; ++c) {
++		c1[c] = touch_rd(base, 0x9c0u + 4u * c);
++		n += snprintf(line + n, sizeof(line) - (size_t)n, " c%u:%llu", c,
++		    (unsigned long long)((uint64_t)(c1[c] - c0[c]) * 1000ULL / (dt / 1000000ULL)));
++	}
++	printf("SURYA STAT: OSM %s cycle counters per second%s\n", name, line);
++}
++
++static void
++stat_cpus(void)
++{
++	for (unsigned cpu = 0; cpu < processor_count && cpu < 8; ++cpu) {
++		uint64_t cycles = 0, ticks = 0;
++		int err = surya_cpu_measure(cpu, 20, &cycles, &ticks);
++		if (err) {
++			printf("SURYA STAT: cpu%u measure failed %d\n", cpu, err);
++		} else {
++			/* 19.2 MHz counter: MHz = cycles * 19.2 / ticks */
++			printf("SURYA STAT: cpu%u %llu cycles in %llu ticks -> %llu MHz\n", cpu,
++			    (unsigned long long)cycles, (unsigned long long)ticks,
++			    (unsigned long long)(ticks ? cycles * 192ULL / 10ULL / ticks : 0));
++		}
++	}
++}
++
++static uint64_t
++stat_copy(void *dst, const void *src, size_t len, unsigned times)
++{
++	uint64_t t0 = surya_now_ns();
++	for (unsigned i = 0; i < times; ++i) {
++		memcpy(dst, src, len);
++	}
++	uint64_t ns = surya_now_ns() - t0;
++	return ns ? (uint64_t)len * times * 1000ULL / ns : 0; /* MB/s */
++}
++
++static void
++stat_copies(void)
++{
++	uint8_t *a = kalloc_data(STAT_COPY_BYTES, Z_WAITOK);
++	uint8_t *b = kalloc_data(STAT_COPY_BYTES, Z_WAITOK);
++	if (!a || !b) {
++		printf("SURYA STAT: no memory for the copy test\n");
++	} else {
++		memset(a, 0x5a, STAT_COPY_BYTES);
++		uint64_t cc = stat_copy(b, a, STAT_COPY_BYTES, 4);
++		uint64_t pc = 0, cp = 0;
++		if (sweet_fb_stat_pixels && sweet_fb_stat_rowbytes) {
++			/* the panel's own top rows, read back then written back: nothing changes */
++			size_t rows = STAT_COPY_BYTES / sweet_fb_stat_rowbytes;
++			if (rows > sweet_fb_stat_height) {
++				rows = sweet_fb_stat_height;
++			}
++			size_t len = rows * sweet_fb_stat_rowbytes;
++			pc = stat_copy(a, (const void *)sweet_fb_stat_pixels, len, 1);
++			cp = stat_copy((void *)sweet_fb_stat_pixels, a, len, 4);
++		}
++		printf("SURYA STAT: copy MB/s: cache->cache %llu, panel->cache %llu, cache->panel %llu\n",
++		    (unsigned long long)cc, (unsigned long long)pc, (unsigned long long)cp);
++	}
++	if (a) {
++		kfree_data(a, STAT_COPY_BYTES);
++	}
++	if (b) {
++		kfree_data(b, STAT_COPY_BYTES);
++	}
++}
++
++static void
++stat_mdss(void)
++{
++	static const uint32_t sspp[5] = {0x5000, 0x7000, 0x25000, 0x27000, 0x29000};
++	static const char *const sspp_name[5] = {"vig0", "vig1", "dma0", "dma1", "dma2"};
++	if (!sst.mdss) {
++		return;
++	}
++	for (unsigned i = 0; i < 5; ++i) {
++		vm_offset_t b = sst.mdss + sspp[i];
++		printf("SURYA STAT: sspp %s src_size %#x src_xy %#x out_size %#x out_xy %#x addr %#x stride %#x "
++		    "format %#x op_mode %#x\n", sspp_name[i], touch_rd(b, 0x00), touch_rd(b, 0x08),
++		    touch_rd(b, 0x0c), touch_rd(b, 0x10), touch_rd(b, 0x14), touch_rd(b, 0x24),
++		    touch_rd(b, 0x30), touch_rd(b, 0x38));
++	}
++	for (unsigned i = 0; i < 6; ++i) {
++		vm_offset_t b = sst.mdss + 0x2000u + 0x200u * i;
++		printf("SURYA STAT: ctl%u layer %#x %#x %#x %#x top %#x flush %#x intf_active %#x fetch_active %#x\n",
++		    i, touch_rd(b, 0x00), touch_rd(b, 0x04), touch_rd(b, 0x08), touch_rd(b, 0x0c),
++		    touch_rd(b, 0x14), touch_rd(b, 0x18), touch_rd(b, 0xf4), touch_rd(b, 0xfc));
++	}
++	uint32_t f0[4], f1[4];
++	for (unsigned i = 0; i < 4; ++i) {
++		vm_offset_t b = sst.mdss + 0x6b000u + 0x800u * i;
++		f0[i] = touch_rd(b, 0xac);
++		printf("SURYA STAT: intf%u timing_en %#x config %#x frame_count %u line_count %u\n", i,
++		    touch_rd(b, 0x00), touch_rd(b, 0x04), f0[i], touch_rd(b, 0xb0));
++	}
++	uint64_t t0 = surya_now_ns();
++	touch_wait(1000);
++	uint64_t dt = surya_now_ns() - t0;
++	for (unsigned i = 0; i < 4; ++i) {
++		f1[i] = touch_rd(sst.mdss + 0x6b000u + 0x800u * i, 0xac);
++		if (f1[i] != f0[i]) {
++			printf("SURYA STAT: intf%u %u frames in %llu ms -> %llu.%llu Hz\n", i, f1[i] - f0[i],
++			    (unsigned long long)(dt / 1000000ULL),
++			    (unsigned long long)((uint64_t)(f1[i] - f0[i]) * 1000000000ULL / dt),
++			    (unsigned long long)((uint64_t)(f1[i] - f0[i]) * 10000000000ULL / dt % 10ULL));
++		}
++	}
++}
++
++static void
++stat_tsens(void)
++{
++	for (unsigned t = 0; t < 2; ++t) {
++		char line[200];
++		int n = 0;
++		if (!sst.tsens[t]) {
++			continue;
++		}
++		for (unsigned s = 0; s < 16; ++s) {
++			uint32_t v = touch_rd(sst.tsens[t], 0xa0u + 4u * s);
++			if (!(v & (1u << 21))) {
++				continue; /* VALID */
++			}
++			int temp = (int)(v & 0xfffu);
++			if (temp & 0x800) {
++				temp -= 0x1000; /* 12-bit signed, 0.1 C */
++			}
++			n += snprintf(line + n, sizeof(line) - (size_t)n, " %u:%d.%d", s, temp / 10,
++			    (temp < 0 ? -temp : temp) % 10);
++		}
++		printf("SURYA STAT: tsens%u C%s\n", t, line);
++	}
++}
++
++static void
++stat_timer_fired(thread_call_param_t p0, thread_call_param_t p1)
++{
++	unsigned which = (unsigned)(uintptr_t)p0;
++	(void)p1;
++	sst.fired_at[which] = surya_now_ns();
++	sst.fired[which] = 1;
++}
++
++static void
++stat_timers(void)
++{
++	thread_call_t calls[2];
++	uint64_t one_s;
++	nanoseconds_to_absolutetime(1000000000ULL, &one_s);
++	uint64_t start = surya_now_ns();
++	for (unsigned i = 0; i < 2; ++i) {
++		calls[i] = thread_call_allocate_with_options(stat_timer_fired, (thread_call_param_t)(uintptr_t)i,
++		    THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
++		if (!calls[i]) {
++			printf("SURYA STAT: no thread_call\n");
++			return;
++		}
++	}
++	(void)thread_call_enter_delayed_with_leeway(calls[0], NULL, mach_absolute_time() + one_s, 0, 0);
++	(void)thread_call_enter_delayed_with_leeway(calls[1], NULL, mach_continuous_time() + one_s, 0,
++	    THREAD_CALL_CONTINUOUS);
++	touch_wait(3000);
++	for (unsigned i = 0; i < 2; ++i) {
++		printf("SURYA STAT: 1 s thread_call on the %s clock %s%llu ms\n",
++		    i ? "continuous" : "absolute", sst.fired[i] ? "fired after " : "NOT fired in ",
++		    (unsigned long long)((sst.fired[i] ? sst.fired_at[i] - start : surya_now_ns() - start) / 1000000ULL));
++		(void)thread_call_cancel(calls[i]);
++		(void)thread_call_free(calls[i]);
++	}
++	printf("SURYA STAT: clocks: absolute %#llx continuous %#llx\n",
++	    (unsigned long long)mach_absolute_time(), (unsigned long long)mach_continuous_time());
++}
++
++static void
++surya_stat_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	touch_wait(60000);
++	sst.l3 = ml_io_map(STAT_OSM_L3_PA, 0x1400);
++	sst.pwr = ml_io_map(STAT_OSM_PWR_PA, 0x1400);
++	sst.perf = ml_io_map(STAT_OSM_PERF_PA, 0x1400);
++	sst.mdss = ml_io_map(STAT_MDSS_PA, 0x85000);
++	sst.tsens[0] = ml_io_map(STAT_TSENS0_PA, 0x1000);
++	sst.tsens[1] = ml_io_map(STAT_TSENS1_PA, 0x1000);
++	printf("SURYA STAT: start, %u processors, panel %ux%u stride %u\n", processor_count,
++	    sweet_fb_stat_width, sweet_fb_stat_height, sweet_fb_stat_rowbytes);
++	stat_osm("L3", sst.l3, 1);
++	stat_osm("small", sst.pwr, 6);
++	stat_osm("big", sst.perf, 2);
++	stat_cpus();
++	stat_copies();
++	stat_mdss();
++	stat_timers();
++	uint64_t swaps = sweet_fb_stat_swaps, dups = sweet_fb_stat_dups, copies = sweet_fb_stat_copies;
++	uint64_t cns = sweet_fb_stat_copy_ns, ticks = sweet_fb_stat_ticks;
++	uint32_t frames = sst.mdss ? touch_rd(sst.mdss + 0x6b800u, 0xac) : 0;
++	for (;;) {
++		unsigned idle[8] = {0}, samples = 0;
++		sweet_fb_stat_copy_max_ns = 0;
++		for (unsigned i = 0; i < 2000; ++i) {
++			unsigned mask = surya_cpu_idle_mask();
++			for (unsigned c = 0; c < 8; ++c) {
++				idle[c] += (mask >> c) & 1u;
++			}
++			++samples;
++			touch_wait(5);
++		}
++		uint64_t s = sweet_fb_stat_swaps, d = sweet_fb_stat_dups, c = sweet_fb_stat_copies;
++		uint64_t n = sweet_fb_stat_copy_ns, t = sweet_fb_stat_ticks;
++		uint32_t f = sst.mdss ? touch_rd(sst.mdss + 0x6b800u, 0xac) : 0;
++		printf("SURYA STAT: 10 s: swaps %llu (same as previous %llu), panel copies %llu "
++		    "mean %llu ms max %llu ms, vsync ticks %llu, panel frames %u, idle %% %u %u %u %u %u %u %u %u\n",
++		    (unsigned long long)(s - swaps), (unsigned long long)(d - dups), (unsigned long long)(c - copies),
++		    (unsigned long long)(c > copies ? (n - cns) / (c - copies) / 1000000ULL : 0),
++		    (unsigned long long)(sweet_fb_stat_copy_max_ns / 1000000ULL), (unsigned long long)(t - ticks),
++		    f - frames, idle[0] * 100u / samples, idle[1] * 100u / samples, idle[2] * 100u / samples,
++		    idle[3] * 100u / samples, idle[4] * 100u / samples, idle[5] * 100u / samples,
++		    idle[6] * 100u / samples, idle[7] * 100u / samples);
++		stat_tsens();
++		swaps = s;
++		dups = d;
++		copies = c;
++		cns = n;
++		ticks = t;
++		frames = f;
++	}
++}
++
  void
  sweet_touch_init(void)
  {
-@@ -644,17 +2905,35 @@
+@@ -644,17 +3218,46 @@
  		return;
  	}
  	st.started = true;
@@ -2341,6 +2662,17 @@ suryavib=0 leaves the chip alone.
  	} else {
  		printf("SWEET TOUCH: kernel_thread_start failed %d\n", kr);
  	}
++	/* suryastat=1: the read-only measurements above. */
++	int stat = 0;
++	(void)PE_parse_boot_argn("suryastat", &stat, sizeof(stat));
++	if (enabled == 2 && stat) {
++		kr = kernel_thread_start(surya_stat_thread, NULL, &thread);
++		if (kr == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			printf("SURYA STAT: kernel_thread_start failed %d\n", kr);
++		}
++	}
 +	/* surya's vibration motor, unless suryavib=0. */
 +	int vib = 1;
 +	(void)PE_parse_boot_argn("suryavib", &vib, sizeof(vib));
