@@ -83,7 +83,7 @@ the RPMh bus clock managers MC0, ACV and SH0 through sweet_rpmh_bcm_vote()
  void sweet_touch_init(void);
  
  #define TOUCH_SE_PA      0x00a84000u
-@@ -635,6 +652,2744 @@
+@@ -635,6 +652,2753 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -2359,7 +2359,8 @@ the RPMh bus clock managers MC0, ACV and SH0 through sweet_rpmh_bcm_vote()
 +#define STAT_COPY_BYTES   (4u << 20)
 +
 +extern unsigned surya_cpu_idle_mask(void);                 /* osfmk/kern/exception.c */
-+extern int surya_cpu_measure(unsigned cpu, unsigned ms, uint64_t *cycles, uint64_t *ticks);
++extern int surya_cpu_measure(unsigned cpu, unsigned ms, uint64_t *cycles, uint64_t *ticks, uint64_t *base);
++extern uint64_t surya_rtclock_base(void);
 +extern int sweet_fb_stat_on;                               /* iokit/Kernel/arm/SweetFramebuffer.cpp */
 +extern uint64_t sweet_fb_stat_swaps, sweet_fb_stat_dups, sweet_fb_stat_copies;
 +extern uint64_t sweet_fb_stat_copy_ns, sweet_fb_stat_copy_max_ns, sweet_fb_stat_ticks;
@@ -2425,16 +2426,24 @@ the RPMh bus clock managers MC0, ACV and SH0 through sweet_rpmh_bcm_vote()
 +static void
 +stat_cpus(void)
 +{
++	/* Also the clocks (22.10: iOS's 1 s vibration stop timer never fired):
++	 * userland builds mach_absolute_time as CNTVCT_EL0 + the commpage's
++	 * rtclock_base_abstime; the kernel adds each CPU's own base. */
++	uint64_t rtb = surya_rtclock_base();
++	printf("SURYA STAT: rtclock_base_abstime %#llx, mach_absolute_time %#llx, CNTVCT %#llx, continuous %#llx\n",
++	    (unsigned long long)rtb, (unsigned long long)mach_absolute_time(),
++	    (unsigned long long)__builtin_arm_rsr64("CNTVCT_EL0"), (unsigned long long)mach_continuous_time());
 +	for (unsigned cpu = 0; cpu < processor_count && cpu < 8; ++cpu) {
-+		uint64_t cycles = 0, ticks = 0;
-+		int err = surya_cpu_measure(cpu, 20, &cycles, &ticks);
++		uint64_t cycles = 0, ticks = 0, base = 0;
++		int err = surya_cpu_measure(cpu, 20, &cycles, &ticks, &base);
 +		if (err) {
 +			printf("SURYA STAT: cpu%u measure failed %d\n", cpu, err);
 +		} else {
 +			/* 19.2 MHz counter: MHz = cycles * 19.2 / ticks */
-+			printf("SURYA STAT: cpu%u %llu cycles in %llu ticks -> %llu MHz\n", cpu,
++			printf("SURYA STAT: cpu%u %llu cycles in %llu ticks -> %llu MHz; timebase base %#llx%s\n", cpu,
 +			    (unsigned long long)cycles, (unsigned long long)ticks,
-+			    (unsigned long long)(ticks ? cycles * 192ULL / 10ULL / ticks : 0));
++			    (unsigned long long)(ticks ? cycles * 192ULL / 10ULL / ticks : 0),
++			    (unsigned long long)base, base == rtb ? "" : " DIFFERS from the commpage's");
 +		}
 +	}
 +}
@@ -2828,7 +2837,7 @@ the RPMh bus clock managers MC0, ACV and SH0 through sweet_rpmh_bcm_vote()
  void
  sweet_touch_init(void)
  {
-@@ -644,17 +3399,67 @@
+@@ -644,17 +3408,67 @@
  		return;
  	}
  	st.started = true;

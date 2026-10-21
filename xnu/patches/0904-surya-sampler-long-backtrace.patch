@@ -10,7 +10,15 @@ processors, and one processor's PMCCNTR_EL0 against CNTVCT_EL0 while bound
 to it.
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -1014,32 +1014,99 @@
+@@ -823,6 +823,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <vm/vm_shared_region.h>
+ #include <arm/thread.h>
++#include <arm/cpu_data_internal.h> /* surya: getCpuDatap()->cpu_base_timebase */
+ 
+ /*
+  * SWEET crash report on the console. The phone has no way to get crash
+@@ -1014,32 +1015,112 @@
  	task_lock(task);
  	queue_iterate(&task->threads, thread, thread_t, task_threads) {
  		arm_saved_state_t *ss = find_user_regs(thread);
@@ -66,7 +74,17 @@ to it.
 + * counter (PMCCNTR_EL0) is free: this kernel's kpc knows Apple PMUs only.
 + */
 +unsigned surya_cpu_idle_mask(void);
-+int surya_cpu_measure(unsigned cpu, unsigned ms, uint64_t *cycles, uint64_t *ticks);
++int surya_cpu_measure(unsigned cpu, unsigned ms, uint64_t *cycles, uint64_t *ticks, uint64_t *base);
++uint64_t surya_rtclock_base(void);
++
++/* The commpage timebase offset userland adds to CNTVCT_EL0 (rtclock.c). */
++extern uint64_t rtclock_base_abstime;
++
++uint64_t
++surya_rtclock_base(void)
++{
++	return rtclock_base_abstime;
++}
 +
 +unsigned
 +surya_cpu_idle_mask(void)
@@ -82,7 +100,7 @@ to it.
 +}
 +
 +int
-+surya_cpu_measure(unsigned cpu, unsigned ms, uint64_t *cycles, uint64_t *ticks)
++surya_cpu_measure(unsigned cpu, unsigned ms, uint64_t *cycles, uint64_t *ticks, uint64_t *base)
 +{
 +	if (cpu >= processor_count || processor_array[cpu] == PROCESSOR_NULL) {
 +		return -1;
@@ -106,6 +124,9 @@ to it.
 +	}
 +	uint64_t c1 = __builtin_arm_rsr64("PMCCNTR_EL0");
 +	__asm__ volatile ("isb" ::: "memory");
++	/* this CPU's mach_absolute_time base: userland uses the commpage's
++	 * rtclock_base_abstime for every CPU, so they must all agree */
++	*base = getCpuDatap()->cpu_base_timebase;
 +	thread_bind(old);
 +	*cycles = c1 - c0;
 +	*ticks = t1 - t0;
