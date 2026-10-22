@@ -59,7 +59,7 @@ unrolled row loop, rows with the same source copied from the row above.
  class IOMobileFramebuffer : public IOService {
  	OSDeclareDefaultStructors(IOMobileFramebuffer);
  };
-@@ -116,13 +133,29 @@
+@@ -116,13 +133,34 @@
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
@@ -74,12 +74,18 @@ unrolled row loop, rows with the same source copied from the row above.
  	void addClient(IOMobileFramebufferUserClient *client);
  	void removeClient(IOMobileFramebufferUserClient *client);
  	void swap(const uint8_t *rec);
- 	void present(const uint8_t *rec);
+-	void present(const uint8_t *rec);
++	void present(const uint8_t *rec) { present(rec, 0, (int32_t)fHeight); }
++	void present(const uint8_t *rec, int32_t rowFrom, int32_t rowTo);
++	/* second copy worker (suryafb=2): the bottom half of every frame */
++	bool fWorkPending, fWorkDone, fWorker;
++	void workerLoop(void);
 +	void copyLoop(void);
 +	void swapWait(void);
  };
 +static int surya_fb_mode;
 +static void surya_fb_copy_thread(void *arg, wait_result_t wr);
++static void surya_fb_worker_thread(void *arg, wait_result_t wr);
 +#define SWEET_FB_MAX_W 1200
 +#define SWEET_FB_MAX_H 2500
 +static int surya_fb_2x;
@@ -89,7 +95,7 @@ unrolled row loop, rows with the same source copied from the row above.
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
-@@ -176,6 +209,26 @@
+@@ -176,6 +214,26 @@
  	}
  	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
  	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
@@ -116,7 +122,7 @@ unrolled row loop, rows with the same source copied from the row above.
  	fLock = IOLockAlloc();
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -195,7 +248,29 @@
+@@ -195,7 +253,34 @@
  	uint32_t hz = 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
@@ -133,6 +139,11 @@ unrolled row loop, rows with the same source copied from the row above.
 +		if (kernel_thread_start(surya_fb_copy_thread, this, &t) == KERN_SUCCESS) {
 +			thread_deallocate(t);
 +			IOLog("SWEET FB: surya mode %d: copy thread, absolute vsync, SwapWait waits\n", surya_fb_mode);
++			if (surya_fb_mode == 2 && kernel_thread_start(surya_fb_worker_thread, this, &t) == KERN_SUCCESS) {
++				thread_deallocate(t);
++				fWorker = true;
++				IOLog("SWEET FB: second copy worker (bottom half)\n");
++			}
 +		} else {
 +			surya_fb_mode = 0;
 +			IOLog("SWEET FB: copy thread failed; old mode\n");
@@ -147,7 +158,7 @@ unrolled row loop, rows with the same source copied from the row above.
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
-@@ -212,11 +287,20 @@
+@@ -212,11 +297,20 @@
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
@@ -168,7 +179,7 @@ unrolled row loop, rows with the same source copied from the row above.
  
  	IOLockLock(fb->fLock);
  	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
-@@ -239,12 +323,20 @@
+@@ -239,12 +333,20 @@
  				}
  			}
  		}
@@ -192,7 +203,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
  		if (rec != NULL) {
  			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
-@@ -256,7 +348,58 @@
+@@ -256,7 +358,97 @@
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
@@ -225,7 +236,21 @@ unrolled row loop, rows with the same source copied from the row above.
 +		memcpy(fCopyRec, fPending, SWEET_FB_SWAP_REC_SIZE);
 +		fDirty = false;
 +		IOLockUnlock(fLock);
-+		present(fCopyRec);
++		if (fWorker) {
++			IOLockLock(fLock);
++			fWorkPending = true;
++			fWorkDone = false;
++			IOLockWakeup(fLock, &fWorkPending, false);
++			IOLockUnlock(fLock);
++			present(fCopyRec, 0, (int32_t)fHeight / 2);
++			IOLockLock(fLock);
++			while (!fWorkDone) {
++				(void)IOLockSleep(fLock, &fWorkDone, THREAD_UNINT);
++			}
++			IOLockUnlock(fLock);
++		} else {
++			present(fCopyRec);
++		}
 +		IOLockLock(fLock);
 +		IOLockWakeup(fLock, &fDirty, false); /* SwapWait: the frame is on the panel */
 +		IOLockUnlock(fLock);
@@ -237,6 +262,31 @@ unrolled row loop, rows with the same source copied from the row above.
 +{
 +	(void)wr;
 +	((AppleCLCD *)arg)->copyLoop();
++}
++
++void
++AppleCLCD::workerLoop(void)
++{
++	for (;;) {
++		IOLockLock(fLock);
++		while (!fWorkPending) {
++			(void)IOLockSleep(fLock, &fWorkPending, THREAD_UNINT);
++		}
++		fWorkPending = false;
++		IOLockUnlock(fLock);
++		present(fCopyRec, (int32_t)fHeight / 2, (int32_t)fHeight);
++		IOLockLock(fLock);
++		fWorkDone = true;
++		IOLockWakeup(fLock, &fWorkDone, false);
++		IOLockUnlock(fLock);
++	}
++}
++
++static void
++surya_fb_worker_thread(void *arg, wait_result_t wr)
++{
++	(void)wr;
++	((AppleCLCD *)arg)->workerLoop();
 +}
 +
 +/* surya mode SwapWait: until the pending frame has been copied, at most 50 ms. */
@@ -252,7 +302,7 @@ unrolled row loop, rows with the same source copied from the row above.
  }
  
  void
-@@ -289,6 +432,37 @@
+@@ -289,6 +481,37 @@
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
@@ -290,7 +340,7 @@ unrolled row loop, rows with the same source copied from the row above.
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
   * A swap only records the frame: copying 10 MB into the panel on every
-@@ -302,7 +476,18 @@
+@@ -302,14 +525,25 @@
  	IOLockLock(fLock);
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
@@ -309,7 +359,15 @@ unrolled row loop, rows with the same source copied from the row above.
  	if ((++sweet_fb_swap_count % 1000) == 0) {
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
  	}
-@@ -390,12 +575,86 @@
+ }
+ 
+ void
+-AppleCLCD::present(const uint8_t *rec)
++AppleCLCD::present(const uint8_t *rec, int32_t rowFrom, int32_t rowTo)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 
+@@ -390,12 +624,92 @@
  		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
@@ -325,8 +383,11 @@ unrolled row loop, rows with the same source copied from the row above.
 +			int32_t py1 = (dy + h) * (int32_t)fHeight / (int32_t)fLogicalH;
 +			int32_t px0 = dx * (int32_t)fWidth / (int32_t)fLogicalW;
 +			int32_t px1 = (dx + w) * (int32_t)fWidth / (int32_t)fLogicalW;
-+			if (py1 > (int32_t)fHeight) {
-+				py1 = (int32_t)fHeight;
++			if (py0 < rowFrom) {
++				py0 = rowFrom;
++			}
++			if (py1 > rowTo) {
++				py1 = rowTo;
 +			}
 +			if (px1 > (int32_t)fWidth) {
 +				px1 = (int32_t)fWidth;
@@ -369,7 +430,7 @@ unrolled row loop, rows with the same source copied from the row above.
 +				}
 +				memcpy(drow + px0, rowbuf + px0, (size_t)(px1 - px0) * 4);
 +			}
-+			if (sweet_fb_stat_on) {
++			if (sweet_fb_stat_on && rowFrom == 0) { /* the top half's time stands for the frame */
 +				uint64_t ns = 0;
 +				absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 +				sweet_fb_stat_copies++;
@@ -381,11 +442,14 @@ unrolled row loop, rows with the same source copied from the row above.
 +		} else if (src != 0 && bpe == 4) {
 +			uint64_t t0 = sweet_fb_stat_on ? mach_absolute_time() : 0;
  			for (int32_t y = 0; y < h; y++) {
++				if (dy + y < rowFrom || dy + y >= rowTo) {
++					continue;
++				}
  				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
  				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
  				    (size_t)w * 4);
  			}
-+			if (sweet_fb_stat_on) {
++			if (sweet_fb_stat_on && rowFrom == 0) { /* the top half's time stands for the frame */
 +				uint64_t ns = 0;
 +				absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 +				sweet_fb_stat_copies++;
@@ -397,7 +461,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		}
  		s->release();
  	}
-@@ -542,10 +801,15 @@
+@@ -542,10 +856,15 @@
  				fFB->fDirty = true;     /* on: redraw the latest frame */
  			}
  			IOLockUnlock(fFB->fLock);
