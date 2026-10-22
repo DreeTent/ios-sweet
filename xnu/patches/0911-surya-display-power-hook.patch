@@ -90,7 +90,7 @@ unrolled row loop, rows with the same source copied from the row above.
 +#define SWEET_FB_MAX_H 2500
 +static int surya_fb_2x;
 +static uint16_t surya_fb_xmap[SWEET_FB_MAX_W], surya_fb_ymap[SWEET_FB_MAX_H];
-+static uint32_t surya_fb_rowbuf[SWEET_FB_MAX_W]; /* one panel row, cached memory */
++static uint32_t surya_fb_rowbuf[2][SWEET_FB_MAX_W]; /* one panel row per copy thread, cached memory */
 +extern "C" int surya_fb2x_reset_cache(void); /* bsd/dev/sweet_touch.c */
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
@@ -367,7 +367,7 @@ unrolled row loop, rows with the same source copied from the row above.
  {
  	uint32_t mask = get32(rec, 0x104);
  
-@@ -390,12 +624,92 @@
+@@ -390,12 +624,93 @@
  		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
@@ -399,7 +399,8 @@ unrolled row loop, rows with the same source copied from the row above.
 +				px1--;
 +			}
 +			int32_t prev_ly = -1;
-+			uint32_t *rowbuf = surya_fb_rowbuf;
++			/* 22.10: one shared row buffer for two threads tore and doubled rows */
++			uint32_t *rowbuf = surya_fb_rowbuf[rowFrom == 0 ? 0 : 1];
 +			for (int32_t py = py0; py < py1 && rowbuf != NULL; py++) {
 +				int32_t ly = (int32_t)surya_fb_ymap[py] - dy;
 +				if (ly < 0 || ly >= h) {
@@ -461,7 +462,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		}
  		s->release();
  	}
-@@ -542,10 +856,15 @@
+@@ -542,10 +857,15 @@
  				fFB->fDirty = true;     /* on: redraw the latest frame */
  			}
  			IOLockUnlock(fFB->fLock);
