@@ -17,6 +17,8 @@ suryafb2x=1 (22.10, wishes/04 step 8): the display is presented as 750x1624
 and the copy thread scales each layer up to the panel, nearest neighbour.
 Needs suryafb=1, /chosen/display-scale 2 in the ADT (scripts/adt-scale.py)
 and the MobileGestalt cache truncated once (surya_fb2x_reset_cache, 0900).
+The @2x scaling copy (22.10, 8-9 ms a frame at first): clamped column range,
+unrolled row loop, rows with the same source copied from the row above.
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -37,6 +37,8 @@
@@ -292,14 +294,17 @@ and the MobileGestalt cache truncated once (surya_fb2x_reset_cache, 0900).
  	if ((++sweet_fb_swap_count % 1000) == 0) {
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
  	}
-@@ -390,12 +562,60 @@
+@@ -390,12 +562,82 @@
  		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
 -		if (src != 0 && bpe == 4) {
 +		if (src != 0 && bpe == 4 && surya_fb_2x && fWidth <= SWEET_FB_MAX_W && fHeight <= SWEET_FB_MAX_H) {
 +			/* @2x: this layer covers logical (dx,dy,w,h); every panel pixel whose
-+			 * logical pixel falls inside takes that pixel (nearest neighbour). */
++			 * logical pixel falls inside takes that pixel (nearest neighbour).
++			 * The panel column range is clamped once so the row loop has no
++			 * checks, and a panel row whose source row is the previous one's
++			 * is copied from the panel row above (y ratio 1.478: a third). */
 +			uint64_t t0 = sweet_fb_stat_on ? mach_absolute_time() : 0;
 +			int32_t py0 = dy * (int32_t)fHeight / (int32_t)fLogicalH;
 +			int32_t py1 = (dy + h) * (int32_t)fHeight / (int32_t)fLogicalH;
@@ -311,19 +316,38 @@ and the MobileGestalt cache truncated once (surya_fb2x_reset_cache, 0900).
 +			if (px1 > (int32_t)fWidth) {
 +				px1 = (int32_t)fWidth;
 +			}
++			while (px0 < px1 && (int32_t)surya_fb_xmap[px0] < dx) {
++				px0++;
++			}
++			while (px1 > px0 && (int32_t)surya_fb_xmap[px1 - 1] >= dx + w) {
++				px1--;
++			}
++			int32_t prev_ly = -1;
 +			for (int32_t py = py0; py < py1; py++) {
 +				int32_t ly = (int32_t)surya_fb_ymap[py] - dy;
 +				if (ly < 0 || ly >= h) {
++					prev_ly = -1;
 +					continue;
 +				}
-+				const uint32_t *srow = (const uint32_t *)(src + s->offset +
-+				    (uint64_t)(sy + ly) * s->bytesPerRow + (uint64_t)sx * 4);
 +				uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
-+				for (int32_t px = px0; px < px1; px++) {
-+					int32_t lx = (int32_t)surya_fb_xmap[px] - dx;
-+					if (lx >= 0 && lx < w) {
-+						drow[px] = srow[lx];
-+					}
++				if (ly == prev_ly) {
++					memcpy(drow + px0, (const uint32_t *)(fPixels + (uint64_t)(py - 1) * fRowBytes) + px0,
++					    (size_t)(px1 - px0) * 4);
++					continue;
++				}
++				prev_ly = ly;
++				const uint32_t *srow = (const uint32_t *)(src + s->offset +
++				    (uint64_t)(sy + ly) * s->bytesPerRow + (uint64_t)sx * 4) - dx;
++				const uint16_t *xm = surya_fb_xmap;
++				int32_t px = px0;
++				for (; px + 4 <= px1; px += 4) {
++					drow[px] = srow[xm[px]];
++					drow[px + 1] = srow[xm[px + 1]];
++					drow[px + 2] = srow[xm[px + 2]];
++					drow[px + 3] = srow[xm[px + 3]];
++				}
++				for (; px < px1; px++) {
++					drow[px] = srow[xm[px]];
 +				}
 +			}
 +			if (sweet_fb_stat_on) {
@@ -354,7 +378,7 @@ and the MobileGestalt cache truncated once (surya_fb2x_reset_cache, 0900).
  		}
  		s->release();
  	}
-@@ -542,10 +762,15 @@
+@@ -542,10 +784,15 @@
  				fFB->fDirty = true;     /* on: redraw the latest frame */
  			}
  			IOLockUnlock(fFB->fLock);

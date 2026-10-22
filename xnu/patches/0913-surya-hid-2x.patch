@@ -1,0 +1,21 @@
+sweet: HID touch mapping for surya's @2x display mode
+
+With suryafb2x=1 the presented 750x1624 display is stretched over the
+whole 1080x2400 panel, so the digitizer maps the panel 1:1 (as
+sweetfb_native) instead of into the centred 1125x2436 canvas.
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -432,8 +432,12 @@
+ 	if (!fLock || !IOHIDEventService::start(provider)) {
+ 		return false;
+ 	}
+-	int native = 0;
++	int native = 0, surya2x = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
++	/* surya suryafb2x=1 (SweetFramebuffer.cpp): the 750x1624 display is
++	 * stretched over the whole panel, so the panel maps 1:1 like native. */
++	PE_parse_boot_argn("suryafb2x", &surya2x, sizeof(surya2x));
++	native = native || surya2x;
+ 	fLogicalW = native ? 1080 : 1125;
+ 	fLogicalH = native ? 2400 : 2436;
+ 	fOffX = (fLogicalW - 1080) / 2;
