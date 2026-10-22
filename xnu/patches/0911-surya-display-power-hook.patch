@@ -180,7 +180,8 @@ unrolled row loop, rows with the same source copied from the row above.
 +		}
  		return;
  	}
- 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && surya_fb_mode != 2;
  	uint8_t *rec = NULL;
 -	if (flush) {
 +	if (flush && surya_fb_mode) {
@@ -289,9 +290,18 @@ unrolled row loop, rows with the same source copied from the row above.
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
   * A swap only records the frame: copying 10 MB into the panel on every
-@@ -303,6 +477,9 @@
+@@ -302,7 +476,18 @@
+ 	IOLockLock(fLock);
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
++	if (surya_fb_mode == 2 && !fPowerOff) {
++		/* suryafb=2 (22.10): the copy starts now, not at the next vsync tick.
++		 * With suryafb=1 CoreAnimation lost the rest of every vsync period
++		 * in SwapWait (render 20 ms -> a 33 ms frame): 22 frames a second
++		 * with half the CPU idle. The panel is not synchronised either way. */
++		fCopyWanted = true;
++		IOLockWakeup(fLock, &fCopyWanted, false);
++	}
  	IOLockUnlock(fLock);
 +	if (sweet_fb_stat_on) {
 +		sweet_fb_stat_swap(rec);
@@ -299,7 +309,7 @@ unrolled row loop, rows with the same source copied from the row above.
  	if ((++sweet_fb_swap_count % 1000) == 0) {
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
  	}
-@@ -390,12 +567,86 @@
+@@ -390,12 +575,86 @@
  		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
@@ -387,7 +397,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		}
  		s->release();
  	}
-@@ -542,10 +793,15 @@
+@@ -542,10 +801,15 @@
  				fFB->fDirty = true;     /* on: redraw the latest frame */
  			}
  			IOLockUnlock(fFB->fLock);
