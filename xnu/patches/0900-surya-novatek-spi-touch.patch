@@ -51,6 +51,8 @@ the boot-arg nothing is written.
 Memory bandwidth, suryaddr=1 (22.10): 70 s after start the top votes for
 the RPMh bus clock managers MC0, ACV and SH0 through sweet_rpmh_bcm_vote()
 (0912). Nothing is voted otherwise.
+surya_fb2x_reset_cache() (22.10): truncates MobileGestalt's cached screen
+class once the root is mounted, for the @2x display mode of 0911.
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
 @@ -14,12 +14,29 @@
@@ -83,7 +85,7 @@ the RPMh bus clock managers MC0, ACV and SH0 through sweet_rpmh_bcm_vote()
  void sweet_touch_init(void);
  
  #define TOUCH_SE_PA      0x00a84000u
-@@ -635,6 +652,2753 @@
+@@ -635,6 +652,2782 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -2654,6 +2656,35 @@ the RPMh bus clock managers MC0, ACV and SH0 through sweet_rpmh_bcm_vote()
 +}
 +
 +/*
++ * suryafb2x=1 (SweetFramebuffer.cpp): MobileGestalt caches the screen class
++ * (display-scale) in this file; with the ADT now saying 2 the cache is
++ * truncated once after the root is mounted, so it is rebuilt. EAGAIN until
++ * the root is there; 0 when done or when there is no such file.
++ */
++#define SURYA_MG_CACHE "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist"
++
++int surya_fb2x_reset_cache(void);
++
++int
++surya_fb2x_reset_cache(void)
++{
++	uint8_t probe = 0;
++	if (!surya_root_ready()) {
++		return EAGAIN;
++	}
++	int err = surya_db_rw(SURYA_MG_CACHE, 0, &probe, 1);
++	if (err == ENOENT) {
++		printf("SURYA FB2X: no MobileGestalt cache yet
++");
++		return 0;
++	}
++	err = surya_db_rw(SURYA_MG_CACHE, 1, &probe, 0);
++	printf("SURYA FB2X: MobileGestalt cache truncated, err %d
++", err);
++	return err;
++}
++
++/*
 + * CPU clocks, boot-arg suryafreq (wishes/04, step 4). Nothing changes them
 + * otherwise: the bootloader's rows stay. The OSM takes a row number of its
 + * table per core (DCVS_PERF_STATE_DESIRED, +0x920 + 4 n), as Linux's
@@ -2837,7 +2868,7 @@ the RPMh bus clock managers MC0, ACV and SH0 through sweet_rpmh_bcm_vote()
  void
  sweet_touch_init(void)
  {
-@@ -644,17 +3408,67 @@
+@@ -644,17 +3437,67 @@
  		return;
  	}
  	st.started = true;
