@@ -18,7 +18,7 @@ to it.
  
  /*
   * SWEET crash report on the console. The phone has no way to get crash
-@@ -1014,32 +1015,112 @@
+@@ -1014,32 +1015,111 @@
  	task_lock(task);
  	queue_iterate(&task->threads, thread, thread_t, task_threads) {
  		arm_saved_state_t *ss = find_user_regs(thread);
@@ -77,13 +77,12 @@ to it.
 +int surya_cpu_measure(unsigned cpu, unsigned ms, uint64_t *cycles, uint64_t *ticks, uint64_t *base);
 +uint64_t surya_rtclock_base(void);
 +
-+/* The commpage timebase offset userland adds to CNTVCT_EL0 (rtclock.c). */
-+extern uint64_t rtclock_base_abstime;
-+
++/* The base this CPU adds to CNTVCT_EL0 (rtclock_base_abstime itself is not
++ * exported; every CPU's cpu_base_timebase is set from it at start). */
 +uint64_t
 +surya_rtclock_base(void)
 +{
-+	return rtclock_base_abstime;
++	return getCpuDatap()->cpu_base_timebase;
 +}
 +
 +unsigned

@@ -2430,7 +2430,7 @@ the RPMh bus clock managers MC0, ACV and SH0 through sweet_rpmh_bcm_vote()
 +	 * userland builds mach_absolute_time as CNTVCT_EL0 + the commpage's
 +	 * rtclock_base_abstime; the kernel adds each CPU's own base. */
 +	uint64_t rtb = surya_rtclock_base();
-+	printf("SURYA STAT: rtclock_base_abstime %#llx, mach_absolute_time %#llx, CNTVCT %#llx, continuous %#llx\n",
++	printf("SURYA STAT: timebase base (this CPU) %#llx, mach_absolute_time %#llx, CNTVCT %#llx, continuous %#llx\n",
 +	    (unsigned long long)rtb, (unsigned long long)mach_absolute_time(),
 +	    (unsigned long long)__builtin_arm_rsr64("CNTVCT_EL0"), (unsigned long long)mach_continuous_time());
 +	for (unsigned cpu = 0; cpu < processor_count && cpu < 8; ++cpu) {
@@ -2443,7 +2443,7 @@ the RPMh bus clock managers MC0, ACV and SH0 through sweet_rpmh_bcm_vote()
 +			printf("SURYA STAT: cpu%u %llu cycles in %llu ticks -> %llu MHz; timebase base %#llx%s\n", cpu,
 +			    (unsigned long long)cycles, (unsigned long long)ticks,
 +			    (unsigned long long)(ticks ? cycles * 192ULL / 10ULL / ticks : 0),
-+			    (unsigned long long)base, base == rtb ? "" : " DIFFERS from the commpage's");
++			    (unsigned long long)base, base == rtb ? "" : " DIFFERS from the first CPU's");
 +		}
 +	}
 +}
