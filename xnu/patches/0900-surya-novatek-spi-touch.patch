@@ -85,7 +85,7 @@ class once the root is mounted, for the @2x display mode of 0911.
  void sweet_touch_init(void);
  
  #define TOUCH_SE_PA      0x00a84000u
-@@ -635,6 +652,2780 @@
+@@ -635,6 +652,2796 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -2657,29 +2657,45 @@ class once the root is mounted, for the @2x display mode of 0911.
 +
 +/*
 + * suryafb2x=1 (SweetFramebuffer.cpp): MobileGestalt caches the screen class
-+ * (display-scale) in this file; with the ADT now saying 2 the cache is
-+ * truncated once after the root is mounted, so it is rebuilt. EAGAIN until
-+ * the root is there; 0 when done or when there is no such file.
++ * (display-scale) in a plist; with the ADT now saying 2 the caches are
++ * truncated as soon as the root is mounted, before MobileGestaltHelper
++ * starts (22.10: truncating only when the first copy was requested came
++ * after it, backboardd still rendered 1125x2436 and never swapped).
 + */
-+#define SURYA_MG_CACHE "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist"
++static const char *const surya_mg_caches[2] = {
++	"/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
++	"/private/var/mobile/Library/Caches/com.apple.MobileGestalt.plist",
++};
++
++static void
++surya_fb2x_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	while (!surya_root_ready()) {
++		touch_wait(20);
++	}
++	for (unsigned i = 0; i < 2; ++i) {
++		uint8_t probe = 0;
++		int err = surya_db_rw(surya_mg_caches[i], 0, &probe, 1);
++		if (err == ENOENT) {
++			printf("SURYA FB2X: no cache %u\n", i);
++			continue;
++		}
++		err = surya_db_rw(surya_mg_caches[i], 1, &probe, 0);
++		printf("SURYA FB2X: cache %u truncated, err %d\n", i, err);
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
 +
 +int surya_fb2x_reset_cache(void);
 +
++/* Kept for SweetFramebuffer.cpp: the work is done by the thread above. */
 +int
 +surya_fb2x_reset_cache(void)
 +{
-+	uint8_t probe = 0;
-+	if (!surya_root_ready()) {
-+		return EAGAIN;
-+	}
-+	int err = surya_db_rw(SURYA_MG_CACHE, 0, &probe, 1);
-+	if (err == ENOENT) {
-+		printf("SURYA FB2X: no MobileGestalt cache yet\n");
-+		return 0;
-+	}
-+	err = surya_db_rw(SURYA_MG_CACHE, 1, &probe, 0);
-+	printf("SURYA FB2X: MobileGestalt cache truncated, err %d\n", err);
-+	return err;
++	return 0;
 +}
 +
 +/*
@@ -2866,7 +2882,7 @@ class once the root is mounted, for the @2x display mode of 0911.
  void
  sweet_touch_init(void)
  {
-@@ -644,17 +3435,67 @@
+@@ -644,17 +3451,78 @@
  		return;
  	}
  	st.started = true;
@@ -2889,6 +2905,17 @@ class once the root is mounted, for the @2x display mode of 0911.
  	} else {
  		printf("SWEET TOUCH: kernel_thread_start failed %d\n", kr);
  	}
++	/* suryafb2x=1: truncate MobileGestalt's screen-class caches at root mount. */
++	int fb2x = 0;
++	(void)PE_parse_boot_argn("suryafb2x", &fb2x, sizeof(fb2x));
++	if (enabled == 2 && fb2x) {
++		kr = kernel_thread_start(surya_fb2x_thread, NULL, &thread);
++		if (kr == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			printf("SURYA FB2X: kernel_thread_start failed %d\n", kr);
++		}
++	}
 +	/* suryastat=1: the read-only measurements above. */
 +	int stat = 0;
 +	(void)PE_parse_boot_argn("suryastat", &stat, sizeof(stat));
