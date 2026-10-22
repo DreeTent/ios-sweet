@@ -85,7 +85,7 @@ class once the root is mounted, for the @2x display mode of 0911.
  void sweet_touch_init(void);
  
  #define TOUCH_SE_PA      0x00a84000u
-@@ -635,6 +652,2782 @@
+@@ -635,6 +652,2780 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -2674,13 +2674,11 @@ class once the root is mounted, for the @2x display mode of 0911.
 +	}
 +	int err = surya_db_rw(SURYA_MG_CACHE, 0, &probe, 1);
 +	if (err == ENOENT) {
-+		printf("SURYA FB2X: no MobileGestalt cache yet
-+");
++		printf("SURYA FB2X: no MobileGestalt cache yet\n");
 +		return 0;
 +	}
 +	err = surya_db_rw(SURYA_MG_CACHE, 1, &probe, 0);
-+	printf("SURYA FB2X: MobileGestalt cache truncated, err %d
-+", err);
++	printf("SURYA FB2X: MobileGestalt cache truncated, err %d\n", err);
 +	return err;
 +}
 +
@@ -2868,7 +2866,7 @@ class once the root is mounted, for the @2x display mode of 0911.
  void
  sweet_touch_init(void)
  {
-@@ -644,17 +3437,67 @@
+@@ -644,17 +3435,67 @@
  		return;
  	}
  	st.started = true;
