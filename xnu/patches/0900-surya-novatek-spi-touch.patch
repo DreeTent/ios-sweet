@@ -85,7 +85,7 @@ class once the root is mounted, for the @2x display mode of 0911.
  void sweet_touch_init(void);
  
  #define TOUCH_SE_PA      0x00a84000u
-@@ -635,6 +652,2796 @@
+@@ -635,6 +652,2820 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -2699,6 +2699,30 @@ class once the root is mounted, for the @2x display mode of 0911.
 +}
 +
 +/*
++ * The panel's current scan line (MDSS INTF1 LINE_COUNT, dpu_hw_intf.c 0xb0;
++ * surya's DSI interface is intf1 at 0xae6b800, suryastat 22.10). Read by
++ * SweetFramebuffer.cpp's copy thread to start a copy right behind the top of
++ * a frame, so the copy (5 ms) stays ahead of the scan (16.7 ms): no tearing
++ * seam (23.10: a seam at the top with copies started at the swap). -1 when
++ * MDSS cannot be mapped.
++ */
++static vm_offset_t surya_mdss_map;
++
++int surya_panel_line(void);
++
++int
++surya_panel_line(void)
++{
++	if (!surya_mdss_map) {
++		surya_mdss_map = ml_io_map(STAT_MDSS_PA, 0x85000);
++		if (!surya_mdss_map) {
++			return -1;
++		}
++	}
++	return (int)(touch_rd(surya_mdss_map + 0x6b800u, 0xb0) & 0xffffu);
++}
++
++/*
 + * CPU clocks, boot-arg suryafreq (wishes/04, step 4). Nothing changes them
 + * otherwise: the bootloader's rows stay. The OSM takes a row number of its
 + * table per core (DCVS_PERF_STATE_DESIRED, +0x920 + 4 n), as Linux's
@@ -2882,7 +2906,7 @@ class once the root is mounted, for the @2x display mode of 0911.
  void
  sweet_touch_init(void)
  {
-@@ -644,17 +3451,78 @@
+@@ -644,17 +3475,78 @@
  		return;
  	}
  	st.started = true;
